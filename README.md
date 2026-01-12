@@ -1,3 +1,9 @@
+[![CI](https://img.shields.io/github/actions/workflow/status/Mallets/thubo/ci.yaml?branch=main)](https://github.com/Mallets/thubo/actions?query=workflow:CI+branch:main)
+[![docs.rs](https://img.shields.io/docsrs/thubo)](https://docs.rs/thubo/latest/thubo/)
+[![Release](https://img.shields.io/crates/v/thubo)](https://crates.io/crates/thubo)
+[![License](https://img.shields.io/badge/License-EPL%202.0-blue)](https://choosealicense.com/licenses/epl-2.0/)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 # Thubo
 
 Thubo is a high-performance TX/RX network pipeline featuring strict priority scheduling, automatic batching, and message fragmentation. It’s designed for applications that require predictable, priority-based message delivery, even under heavy load.
