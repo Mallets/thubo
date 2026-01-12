@@ -1,0 +1,28 @@
+[package]
+name = "thubo-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.54", features = ["derive"] }
+quanta = { version = "0.12.6" }
+rustls = { version = "0.23.36" }
+rustls-pemfile = { version = "2.2.0" }
+thubo = { path = "../", features = ["stats"] }
+tokio = { version = "1.49.0" }
+tokio-rustls = { version = "0.26.4" }
+
+[profile.dev]
+debug = true
+opt-level = 0
+
+[profile.release]
+codegen-units = 1
+debug = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
