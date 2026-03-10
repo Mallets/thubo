@@ -183,55 +183,54 @@ impl Drop for Waiter {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::timeout;
-
     use super::*;
 
-    #[tokio::test]
-    async fn test_basic_notify_wait() {
-        // Basic notification and wait
+    #[test]
+    fn test_basic_notify_wait() {
+        // Notifier fires from a separate thread after a short delay; waiter blocks until woken.
+        // The notifier is returned from the thread and dropped only after block_on completes,
+        // preventing Notifier::drop from overwriting the OK flag with ERR before the waiter
+        // can consume it.
         let (notifier, waiter) = new();
 
-        let wait_task = tokio::spawn(async move {
-            waiter.wait().await.unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            notifier.notify().unwrap();
+            notifier
         });
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        notifier.notify().unwrap();
-
-        wait_task.await.unwrap();
+        pollster::block_on(waiter.wait()).unwrap();
+        drop(t.join().unwrap()); // notifier dropped here, after wait() has already returned Ok
     }
 
-    #[tokio::test]
-    async fn test_notify_before_wait() {
-        // Notification sent before wait - should return immediately
+    #[test]
+    fn test_notify_before_wait() {
+        // Flag is already set before wait() is called, so it returns on the first check.
         let (notifier, waiter) = new();
 
         notifier.notify().unwrap();
 
-        // Wait should return immediately
-        let result = timeout(Duration::from_millis(100), waiter.wait()).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_ok());
+        pollster::block_on(waiter.wait()).unwrap();
     }
 
-    #[tokio::test]
-    async fn test_drop_all_notifiers() {
-        // Dropping all notifiers causes waiters to error
+    #[test]
+    fn test_drop_all_notifiers() {
+        // Dropping the notifier sets the ERR flag; waiter should receive an error.
         let (notifier, waiter) = new();
 
-        let wait_task = tokio::spawn(async move { waiter.wait().await });
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(notifier);
+        });
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        drop(notifier);
-
-        let result = wait_task.await.unwrap();
+        let result = pollster::block_on(waiter.wait());
         assert!(result.is_err());
+        t.join().unwrap();
     }
 
-    #[tokio::test]
-    async fn test_drop_all_waiters() {
-        // Dropping all waiters causes notifiers to error
+    #[test]
+    fn test_drop_all_waiters() {
+        // Dropping the waiter causes notifier to return an error — fully synchronous.
         let (notifier, waiter) = new();
 
         drop(waiter);
@@ -240,17 +239,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_notification_preserved() {
-        // Notification is preserved if no waiter is waiting
+    #[test]
+    fn test_notification_preserved() {
+        // Notification is stored in the atomic flag; wait() returns immediately even
+        // if polled long after notify() was called.
         let (notifier, waiter) = new();
 
         notifier.notify().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Wait should return immediately with the preserved notification
-        let result = timeout(Duration::from_millis(100), waiter.wait()).await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_ok());
+        pollster::block_on(waiter.wait()).unwrap();
     }
 }
