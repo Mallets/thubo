@@ -866,7 +866,7 @@ pub(crate) fn pipeline_tx(capacity: usize, batch_size: BatchSize) -> (PipelineTx
     (ptxin, ptxout)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use tokio::time::timeout;
 

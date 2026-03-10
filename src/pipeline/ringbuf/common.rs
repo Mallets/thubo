@@ -188,8 +188,14 @@ impl<T> RingBuffer<T> {
 
     #[allow(clippy::mut_from_ref)]
     unsafe fn get_elem_mut(&self, priority: Priority, idx: Idx) -> &mut MaybeUninit<T> {
-        let idx = idx.index(priority) & self.mask;
-        unsafe { self.get_slice_mut(priority).get_unchecked_mut(idx as usize) }
+        let slot = (idx.index(priority) & self.mask) as usize;
+        // Compute the element pointer via raw pointer arithmetic, bypassing `get_slice_mut`.
+        // Creating `&mut [MaybeUninit<T>]` for the whole slice would retag every byte in the
+        // allocation under Stacked Borrows, which races with any concurrent access to a
+        // different element on another thread. Working directly with a thin raw pointer
+        // narrows the exclusive claim to exactly the one slot being accessed.
+        let base = unsafe { *self.ptr.get_unchecked(priority as usize) } as *mut MaybeUninit<T>;
+        unsafe { &mut *base.add(slot) }
     }
 }
 

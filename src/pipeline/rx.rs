@@ -488,7 +488,7 @@ impl DefragBuffer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use std::time::Duration;
 

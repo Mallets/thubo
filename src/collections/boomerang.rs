@@ -20,18 +20,15 @@ use crate::buffers::DynBuf;
 /// ```
 /// use thubo::collections::Boomerang;
 ///
-/// #[tokio::main]
-/// async fn main() {
-///     let buffer = vec![1, 2, 3, 4, 5];
-///     let (bytes, boomerang) = Boomerang::new(buffer.clone());
+/// let buffer = vec![1, 2, 3, 4, 5];
+/// let (boomerang, mut receiver) = Boomerang::new(buffer.clone());
 ///
-///     // Use the bytes...
-///     drop(bytes);
+/// // Drop the boomerang — this sends the value back through the channel.
+/// drop(boomerang);
 ///
-///     // The original value is returned through the receiver
-///     let returned = boomerang.await.unwrap();
-///     assert_eq!(returned, buffer);
-/// }
+/// // The original value is returned through the receiver.
+/// let returned = receiver.try_recv().unwrap();
+/// assert_eq!(returned, buffer);
 /// ```
 pub struct Boomerang<T> {
     inner: Option<(T, oneshot::Sender<T>)>,
@@ -78,34 +75,34 @@ where
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_boomerang() {
+    #[test]
+    fn test_boomerang() {
         // 1. Basic return behavior
         let value = vec![1, 2, 3, 4, 5];
-        let (boomerang, receiver) = Boomerang::new(value.clone());
+        let (boomerang, mut receiver) = Boomerang::new(value.clone());
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned, value);
 
         // 2. Return with integer
         let num = 42;
-        let (boomerang, receiver) = Boomerang::new(num);
+        let (boomerang, mut receiver) = Boomerang::new(num);
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned, num);
 
         // 3. Return with String
         let text = String::from("hello world");
-        let (boomerang, receiver) = Boomerang::new(text.clone());
+        let (boomerang, mut receiver) = Boomerang::new(text.clone());
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned, text);
 
         // 4. Return with buffer
         let buffer = vec![0u8; 1024];
-        let (boomerang, receiver) = Boomerang::new(buffer);
+        let (boomerang, mut receiver) = Boomerang::new(buffer);
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned.len(), 1024);
         assert!(returned.iter().all(|&x| x == 0));
 
@@ -114,24 +111,24 @@ mod tests {
         let v2 = vec![3, 4];
         let v3 = vec![5, 6];
 
-        let (b1, r1) = Boomerang::new(v1.clone());
-        let (b2, r2) = Boomerang::new(v2.clone());
-        let (b3, r3) = Boomerang::new(v3.clone());
+        let (b1, mut r1) = Boomerang::new(v1.clone());
+        let (b2, mut r2) = Boomerang::new(v2.clone());
+        let (b3, mut r3) = Boomerang::new(v3.clone());
 
         drop(b1);
         drop(b2);
         drop(b3);
 
-        assert_eq!(r1.await.unwrap(), v1);
-        assert_eq!(r2.await.unwrap(), v2);
-        assert_eq!(r3.await.unwrap(), v3);
+        assert_eq!(r1.try_recv().unwrap(), v1);
+        assert_eq!(r2.try_recv().unwrap(), v2);
+        assert_eq!(r3.try_recv().unwrap(), v3);
     }
 
-    #[tokio::test]
-    async fn test_boomerang_with_dynbuf() {
+    #[test]
+    fn test_boomerang_with_dynbuf() {
         // 1. DynBuf implementation with Vec
         let data = vec![1u8, 2, 3, 4, 5];
-        let (boomerang, receiver) = Boomerang::new(data.clone());
+        let (boomerang, mut receiver) = Boomerang::new(data.clone());
 
         // Access as DynBuf
         assert_eq!(boomerang.as_slice(), &[1, 2, 3, 4, 5]);
@@ -140,23 +137,23 @@ mod tests {
         let _any = boomerang.as_any();
 
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned, data);
 
         // 2. Boomerang with larger buffer
         let large_data = vec![42u8; 10000];
-        let (boomerang, receiver) = Boomerang::new(large_data.clone());
+        let (boomerang, mut receiver) = Boomerang::new(large_data.clone());
 
         assert_eq!(boomerang.as_slice().len(), 10000);
         assert!(boomerang.as_slice().iter().all(|&x| x == 42));
 
         drop(boomerang);
-        let returned = receiver.await.unwrap();
+        let returned = receiver.try_recv().unwrap();
         assert_eq!(returned.len(), 10000);
     }
 
-    #[tokio::test]
-    async fn test_boomerang_pool_pattern() {
+    #[test]
+    fn test_boomerang_pool_pattern() {
         // Simulate a buffer pool pattern
         let mut pool = Vec::new();
 
@@ -167,7 +164,7 @@ mod tests {
 
         // Take buffer from pool, use it, and get it back via boomerang
         let buffer = pool.pop().unwrap();
-        let (boomerang, receiver) = Boomerang::new(buffer);
+        let (boomerang, mut receiver) = Boomerang::new(buffer);
 
         // Simulate usage
         assert_eq!(boomerang.as_slice().len(), 512);
@@ -175,18 +172,18 @@ mod tests {
         drop(boomerang);
 
         // Return to pool
-        let returned_buffer = receiver.await.unwrap();
+        let returned_buffer = receiver.try_recv().unwrap();
         pool.push(returned_buffer);
 
         assert_eq!(pool.len(), 3);
     }
 
-    #[tokio::test]
-    async fn test_boomerang_ordering() {
+    #[test]
+    fn test_boomerang_ordering() {
         // Test that boomerangs return in the order they are dropped
-        let (b1, r1) = Boomerang::new(1);
-        let (b2, r2) = Boomerang::new(2);
-        let (b3, r3) = Boomerang::new(3);
+        let (b1, mut r1) = Boomerang::new(1);
+        let (b2, mut r2) = Boomerang::new(2);
+        let (b3, mut r3) = Boomerang::new(3);
 
         // Drop in reverse order
         drop(b3);
@@ -194,9 +191,9 @@ mod tests {
         drop(b1);
 
         // But receive in any order (they're independent)
-        let v1 = r1.await.unwrap();
-        let v2 = r2.await.unwrap();
-        let v3 = r3.await.unwrap();
+        let v1 = r1.try_recv().unwrap();
+        let v2 = r2.try_recv().unwrap();
+        let v3 = r3.try_recv().unwrap();
 
         assert_eq!(v1, 1);
         assert_eq!(v2, 2);

@@ -74,7 +74,10 @@ mod tests {
     // Elements arrive in order
     #[test]
     fn it_works() {
+        #[cfg(not(miri))]
         const N: usize = 1_000_000;
+        #[cfg(miri)]
+        const N: usize = 64;
 
         let (mut writers, mut rx) = ringbuffer_mpsc::<usize>(16);
 

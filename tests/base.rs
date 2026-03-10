@@ -30,6 +30,7 @@ async fn pong(barrier: Arc<Barrier>) {
     }
 }
 
+#[cfg(not(miri))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn base() {
     let barrier = Arc::new(Barrier::new(2));
