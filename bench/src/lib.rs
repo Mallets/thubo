@@ -32,11 +32,7 @@ where
         let SenderStats { batches, bytes, .. } = sender_task.get_stats();
         let diff_batches = batches - tot_batches;
         let diff_bytes = bytes - tot_bytes;
-        let avg_bytes = if diff_batches != 0 {
-            diff_bytes / diff_batches
-        } else {
-            0
-        };
+        let avg_bytes = diff_bytes.checked_div(diff_batches).unwrap_or(0);
         let gbps = (8 * diff_bytes) as f64 / 1_000_000_000.0;
 
         println!(
@@ -80,11 +76,7 @@ where
 
         let diff_batches = batches - tot_batches;
         let diff_bytes = bytes - tot_bytes;
-        let avg_bytes = if diff_batches != 0 {
-            diff_bytes / diff_batches
-        } else {
-            0
-        };
+        let avg_bytes = diff_bytes.checked_div(diff_batches).unwrap_or(0);
         let gbps = (8 * diff_bytes) as f64 / 1_000_000_000.0;
 
         println!(

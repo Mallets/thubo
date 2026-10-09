@@ -558,6 +558,13 @@ impl Reader for BytesReader<'_> {
         s.iter().fold(0, |acc, it| acc + it.len()) - self.cursor.byte
     }
 
+    fn contiguous_remaining(&self) -> usize {
+        match self.inner.chunks.get(self.cursor.slice) {
+            Some(slice) => slice.len() - self.cursor.byte,
+            None => 0,
+        }
+    }
+
     fn read_chunks<F: FnMut(Chunk)>(&mut self, len: usize, mut f: F) -> Result<(), DidntRead> {
         if self.remaining() < len {
             return Err(DidntRead);

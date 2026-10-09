@@ -29,6 +29,7 @@ use crate::{
     },
     protocol::{BatchSize, QoS},
     sync::AtomicDuration,
+    transport::{BatchWriter, TokioWriter},
 };
 
 /// High-level sender for transmitting messages over the network.
@@ -429,10 +430,7 @@ impl<W> SenderTask<W> {
 ///
 /// This builder allows you to customize the reception pipeline parameters before
 /// spawning the background task that handles network I/O and message reassembly.
-pub struct SenderBuilder<R>
-where
-    R: AsyncWriteExt + Send + Sync + Unpin + 'static,
-{
+pub struct SenderBuilder<R> {
     qos: QoS,
     capacity: usize,
     batch_size: BatchSize,
@@ -442,10 +440,7 @@ where
     writer: R,
 }
 
-impl<R> SenderBuilder<R>
-where
-    R: AsyncWriteExt + Send + Sync + Unpin + 'static,
-{
+impl<R> SenderBuilder<R> {
     /// Sets the QoS paramters.
     #[must_use]
     pub fn qos(mut self, qos: QoS) -> Self {
@@ -552,7 +547,19 @@ where
     /// - A read timeout occurs
     /// - The task is explicitly stopped via [`SenderTask::stop()`]
     #[must_use]
-    pub fn build(self) -> (Sender, SenderTask<R>) {
+    pub fn build(self) -> (Sender, SenderTask<R>)
+    where
+        R: AsyncWriteExt + Send + Sync + Unpin + 'static,
+    {
+        self.build_with(|pipeline, writer, inner, token| {
+            tokio::spawn(async move { write_task(pipeline, TokioWriter(writer), inner, token).await.0 })
+        })
+    }
+
+    fn build_with(
+        self,
+        spawn: impl FnOnce(PipelineTxOut, R, Arc<SenderTaskInner>, CancellationToken) -> JoinHandle<R>,
+    ) -> (Sender, SenderTask<R>) {
         let Self {
             qos,
             capacity,
@@ -577,8 +584,7 @@ where
         });
         let c_inner = inner.clone();
 
-        // Spawn the background reader task
-        let handle = tokio::spawn(write_task(pipeline_out, writer, c_inner, c_token));
+        let handle = spawn(pipeline_out, writer, c_inner, c_token);
 
         let sender = Sender {
             inner: pipeline_in,
@@ -601,35 +607,34 @@ async fn write_task<W>(
     token: CancellationToken,
 ) -> W
 where
-    W: AsyncWriteExt + Send + Sync + Unpin + 'static,
+    W: BatchWriter,
 {
+    const COALESCE_MAX_BYTES: usize = 512 * 1024;
+    const COALESCE_MAX_BATCHES: usize = 8;
+
     // Helper macro for writing data to the network with timeout protection
-    macro_rules! write_batch {
-        ($batch:expr) => {{
+    macro_rules! write_batches {
+        ($batches:expr) => {{
+            let batches = $batches;
+            let count = batches.len();
             let timeout = inner.write_timeout.load(Ordering::Relaxed);
-            tokio::time::timeout(timeout, async {
-                let mut written = 0;
-
-                // Write the frame header (contains batch size and header)
-                let frame = $batch.frame.as_slice();
-                writer.write_all(frame).await?;
-                written += frame.len();
-
-                // Write each fragment slice in the batch (the actual message data)
-                // This is no-op in case the message is not fragmented
-                for s in $batch.fragment.slices() {
-                    writer.write_all(s).await?;
-                    written += s.len();
+            match tokio::time::timeout(timeout, writer.write_batches(batches, timeout)).await {
+                Ok(Ok((batches, written))) => {
+                    for batch in batches {
+                        pipeline_out.refill(batch);
+                    }
+                    #[cfg(feature = "stats")]
+                    {
+                        inner.stats.batches_count.fetch_add(count, Ordering::Release);
+                        inner.stats.bytes_count.fetch_add(written, Ordering::Release);
+                    }
+                    Ok(written)
                 }
-
-                // Flush
-                writer.flush().await?;
-
-                // Return the batch buffer to the pool for reuse
-                pipeline_out.refill($batch);
-                Ok::<usize, std::io::Error>(written)
-            })
-            .await
+                _ => {
+                    writer.cancel();
+                    Err(())
+                }
+            }
         }};
     }
 
@@ -643,11 +648,35 @@ where
         let res = select! {
             // Try to pull a batch with keep-alive timeout
             res = tokio::time::timeout(keep_alive, pipeline_out.pull(&config)) => match res {
-                Ok(batch) => batch,
+                Ok(batch) => match batch {
+                    Some(first) => {
+                        // Coalesce batches that are already complete without
+                        // waiting for more; ordering and backpressure are unchanged.
+                        let mut batches = vec![first];
+                        let mut bytes = batches[0].len() as usize;
+                        while batches.len() < COALESCE_MAX_BATCHES && bytes < COALESCE_MAX_BYTES {
+                            match pipeline_out.try_pull() {
+                                Some(batch) => {
+                                    bytes += batch.len() as usize;
+                                    batches.push(batch);
+                                }
+                                None => break,
+                            }
+                        }
+                        Some(batches)
+                    }
+                    None => None,
+                },
                 // Send a keep-alive (0 bytes to read)
-                Err(_) => match writer.write_all(&BatchSize::MIN.to_le_bytes()).await {
-                    Ok(_) => continue,
-                    Err(_) => break,
+                Err(_) => {
+                    let timeout = inner.write_timeout.load(Ordering::Relaxed);
+                    match tokio::time::timeout(timeout, writer.keep_alive(timeout)).await {
+                        Ok(Ok(())) => continue,
+                        _ => {
+                            writer.cancel();
+                            return writer;
+                        }
+                    }
                 },
             },
             // Check if shutdown was requested
@@ -657,29 +686,23 @@ where
         };
 
         // Handle the pull result
-        let batch = match res {
-            // Batch is available - transmit it
-            Some(batch) => batch,
+        let batches = match res {
+            // Batches are available - transmit them
+            Some(batches) => batches,
             // Pipeline is closed - exit gracefully
             None => break,
         };
 
-        // Write the batch to the network
-        let Ok(Ok(_written)) = write_batch!(batch) else {
-            break; // Network error - terminate
+        // Write the batches to the network
+        let Ok(_written) = write_batches!(batches) else {
+            // Never send later bytes after a partial batch failed.
+            return writer;
         };
-
-        // Update statistics (only with `stats` feature)
-        #[cfg(feature = "stats")]
-        {
-            inner.stats.batches_count.fetch_add(1, Ordering::Release);
-            inner.stats.bytes_count.fetch_add(_written, Ordering::Release);
-        }
     }
 
     // Graceful shutdown: drain and transmit remaining batches
     for batch in pipeline_out.drain().await.drain(..) {
-        let Ok(Ok(_)) = write_batch!(batch) else {
+        let Ok(_) = write_batches!(vec![batch]) else {
             break; // Stop on first error during drain
         };
     }
@@ -706,7 +729,7 @@ where
     SenderBuilder {
         qos: QoS::DEFAULT,
         capacity: 16,
-        batch_size: BatchSize::MAX,
+        batch_size: 65_535,
         timeout: Duration::from_secs(60),
         timeout_progress: Duration::from_secs(10),
         timeout_batch: Duration::from_micros(100),

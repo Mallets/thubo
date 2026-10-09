@@ -306,6 +306,7 @@ pub mod collections;
 mod pipeline;
 mod protocol;
 mod sync;
+mod transport;
 
 pub use api::*;
 pub use buffers::{bytes::*, chunk::*};

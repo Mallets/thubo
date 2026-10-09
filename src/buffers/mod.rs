@@ -226,6 +226,17 @@ pub(crate) mod reader {
             if read.get() == 1 { Ok(byte) } else { Err(DidntRead) }
         }
 
+        /// Returns the number of bytes available in the current contiguous
+        /// chunk from the read position.
+        ///
+        /// Readers whose next `read_chunk` can be served without copying
+        /// return that byte count; `0` means the value is unknown or the
+        /// next bytes are not contiguous. Decoders use this to skip
+        /// per-chunk iteration for the common single-chunk case.
+        fn contiguous_remaining(&self) -> usize {
+            0
+        }
+
         /// Returns `true` if there is more data to read.
         fn can_read(&self) -> bool {
             self.remaining() != 0
