@@ -52,7 +52,7 @@ struct Args {
     #[arg(short, long, default_value = "16")]
     capacity: usize,
     #[arg(short, long, default_value = "65535")]
-    batch_size: u16,
+    batch_size: u32,
     #[arg(short, long, default_value = "1.0")]
     interval: f32,
     #[arg(short, long, default_value = "0.0001")]

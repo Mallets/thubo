@@ -132,6 +132,8 @@ immutable receive-buffer views. Already-complete batches are coalesced into a
 single bounded (≤512 KiB) scatter/gather send. Read deadlines use a Tokio timer
 instead of per-operation kernel linked timeouts; cancelled I/O retains its
 storage until completion is observed (reaping it with `AsyncCancel` if needed).
+Batches carry a 32-bit length prefix (sender `batch_size` default 65,535; the
+receiver rejects frames above `max_batch_size`, default 16 MiB).
 It does not yet implement multishot receive, SQPOLL, or kernel zero-copy send.
 Existing Tokio APIs and default features remain unchanged.
 
@@ -146,6 +148,9 @@ reverted as unmeasurable. Its final pinned loopback comparison measured
 Tokio TCP at every size and ahead of the raw-TCP iperf3 reference — at 24–48%
 lower CPU-s/GiB than the previous io_uring backend.
 These results are not a universal performance guarantee or physical-network results.
+With 32-bit batch lengths, larger `batch_size` values (256 KiB–1 MiB) measured a
+further **+4–11% throughput** and up to −8% CPU for ≥1 KiB payloads on the same
+benchmark; see [the batch-length study](bench/results/batch32/REPORT.md).
 
 ## Performance
 

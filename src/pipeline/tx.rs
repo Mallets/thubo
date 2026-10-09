@@ -34,6 +34,11 @@ use crate::{
 };
 
 // AtomicBackoff
+// Packs the booked byte count (low bits) and a wrapping microsecond timestamp
+// of the first write (high bits) into one atomic. The timestamp wraps; batch
+// ages are microseconds-to-milliseconds, far below the wrap period, so
+// wrapping-subtraction is unambiguous except for at most one early flush each
+// time the timestamp wraps.
 struct AtomicBackoff(AtomicU64);
 
 impl AtomicBackoff {
@@ -46,20 +51,19 @@ impl AtomicBackoff {
     }
 
     fn start(&self, first_write: Duration) {
-        self.0
-            .store((first_write.as_micros() as u64) << BatchSize::BITS, Ordering::Release);
+        let micros = first_write.as_micros() as u32;
+        self.0.store((micros as u64) << BatchSize::BITS, Ordering::Release);
     }
 
     fn update(&self, bytes: BatchSize) {
         self.0.fetch_or(bytes as u64, Ordering::AcqRel);
     }
 
-    fn load(&self) -> (BatchSize, Duration) {
+    fn load(&self) -> (BatchSize, u32) {
         let value = self.0.load(Ordering::Acquire);
         let bytes = value as BatchSize;
-        let microseconds = value >> BatchSize::BITS;
-        let first_write = Duration::from_micros(microseconds);
-        (bytes, first_write)
+        let first_write_micros = (value >> BatchSize::BITS) as u32;
+        (bytes, first_write_micros)
     }
 }
 
@@ -706,7 +710,7 @@ impl PipelineTxOut {
 
                         backoff_num[p] += 1;
 
-                        let (len, first_write) = self.stage_in.backoff[p].load();
+                        let (len, first_write_micros) = self.stage_in.backoff[p].load();
 
                         let old_len = booked_len[p];
                         booked_len[p] = len;
@@ -719,7 +723,8 @@ impl PipelineTxOut {
                             cmp::Ordering::Equal => true,
                             cmp::Ordering::Greater => false,
                         } || {
-                            let age = LOCAL_EPOCH.elapsed().saturating_sub(first_write);
+                            let now_micros = LOCAL_EPOCH.elapsed().as_micros() as u32;
+                            let age = Duration::from_micros(u64::from(now_micros.wrapping_sub(first_write_micros)));
                             let check = age > config.max_batch_age;
                             if check {
                                 self.stage_in.status.set(status::flush(p));
@@ -1131,5 +1136,39 @@ mod tests {
 
         // Should have drained all batches
         assert!(!batches.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use std::time::Duration;
+
+    use super::AtomicBackoff;
+
+    #[test]
+    fn backoff_packs_bytes_and_timestamp() {
+        let backoff = AtomicBackoff::new();
+        backoff.start(Duration::from_micros(1_234));
+        backoff.update(5678);
+        let (bytes, micros) = backoff.load();
+        assert_eq!(bytes, 5678);
+        assert_eq!(micros, 1234);
+    }
+
+    #[test]
+    fn backoff_timestamp_wraps_without_panic() {
+        let backoff = AtomicBackoff::new();
+        // Start just below the 32-bit microsecond wrap; the consumer computes
+        // age with wrapping subtraction, so a small positive age survives wrap.
+        backoff.start(Duration::from_micros(u64::from(u32::MAX)));
+        backoff.update(99);
+        let (bytes, micros) = backoff.load();
+        assert_eq!(bytes, 99);
+        assert_eq!(micros, u32::MAX);
+        let now = 5_u32; // wrapped past the start point
+        let age = u64::from(now.wrapping_sub(micros));
+        assert_eq!(age, 6);
+        // A batch older than the wrap period misreports once per wrap; ages here
+        // are microseconds-to-milliseconds, so this is unambiguous in practice.
     }
 }

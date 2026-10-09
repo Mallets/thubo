@@ -462,7 +462,10 @@ impl<R> SenderBuilder<R> {
 
     /// Sets the batch size.
     ///
-    /// Default: 65_535 bytes (max: 65_535 bytes)
+    /// Default: 65_535 bytes
+    ///
+    /// The receiver's `max_batch_size` (default 16 MiB) must be at least this
+    /// value, or batches will be rejected as protocol violations.
     #[must_use]
     pub fn batch_size(mut self, batch_size: BatchSize) -> Self {
         self.batch_size = batch_size;
@@ -742,7 +745,7 @@ pub(crate) fn sender_builder<W>(writer: W) -> SenderBuilder<W> {
     SenderBuilder {
         qos: QoS::DEFAULT,
         capacity: 16,
-        batch_size: BatchSize::MAX,
+        batch_size: 65_535,
         timeout: Duration::from_secs(60),
         timeout_progress: Duration::from_secs(10),
         timeout_batch: Duration::from_micros(100),

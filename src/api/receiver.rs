@@ -66,7 +66,7 @@ use crate::{
         self,
         rx::{PipelineRxIn, PipelineRxOut, PullConfig, PushConfig, RecvError, SendError},
     },
-    protocol::core::QoS,
+    protocol::{BATCH_HEADER_BYTES, MAX_BATCH_DEFAULT, core::QoS},
     sync::AtomicDuration,
     transport::{BatchReader, TokioReader},
 };
@@ -475,6 +475,7 @@ pub struct ReceiverBuilder<R> {
     capacity: usize,
     timeout: Duration,
     max_frag_size: usize,
+    max_batch_size: usize,
     reader: R,
 }
 
@@ -535,6 +536,20 @@ impl<R> ReceiverBuilder<R> {
         self
     }
 
+    /// Sets the largest accepted batch length in bytes.
+    ///
+    /// Default: 16 MiB
+    ///
+    /// Batches whose 32-bit length prefix exceeds this limit are rejected as a
+    /// protocol violation before any sized allocation, bounding receiver
+    /// memory against untrusted input. The sender's `batch_size` must not
+    /// exceed the receiver's `max_batch_size`.
+    #[must_use]
+    pub fn max_batch_size(mut self, max_batch_size: usize) -> Self {
+        self.max_batch_size = max_batch_size;
+        self
+    }
+
     /// Builds and returns a [`Receiver`] and [`ReceiverTask`].
     ///
     /// This method creates the complete reception pipeline:
@@ -552,8 +567,13 @@ impl<R> ReceiverBuilder<R> {
     where
         R: AsyncReadExt + Send + Sync + Unpin + 'static,
     {
+        let max_batch = self.max_batch_size;
         self.build_with(|pipeline, reader, inner, token| {
-            tokio::spawn(async move { read_task(pipeline, TokioReader(reader), inner, token).await.0 })
+            tokio::spawn(async move {
+                read_task(pipeline, TokioReader::new(reader, max_batch), inner, token)
+                    .await
+                    .reader
+            })
         })
     }
 
@@ -564,6 +584,7 @@ impl<R> ReceiverBuilder<R> {
         let Self {
             capacity,
             max_frag_size,
+            max_batch_size: _,
             timeout,
             reader,
         } = self;
@@ -602,7 +623,11 @@ impl ReceiverBuilder<crate::uring::Reader> {
     /// Builds a receiver using the owned-buffer io_uring transport.
     #[must_use]
     pub fn build_uring(self) -> (Receiver, ReceiverTask<crate::uring::Reader>) {
-        self.build_with(|pipeline, reader, inner, token| tokio::spawn(read_task(pipeline, reader, inner, token)))
+        let max_batch = self.max_batch_size;
+        self.build_with(|pipeline, mut reader, inner, token| {
+            reader.max_batch = max_batch;
+            tokio::spawn(read_task(pipeline, reader, inner, token))
+        })
     }
 }
 
@@ -633,7 +658,10 @@ where
         #[cfg(feature = "stats")]
         {
             inner.stats.batches_count.fetch_add(1, Ordering::Relaxed);
-            inner.stats.bytes_count.fetch_add(len + 2, Ordering::Relaxed);
+            inner
+                .stats
+                .bytes_count
+                .fetch_add(len + BATCH_HEADER_BYTES, Ordering::Relaxed);
         }
 
         let config = inner.push_config();
@@ -692,7 +720,7 @@ where
 ///
 /// # Protocol
 ///
-/// Each batch is read with a 2-byte length header (little-endian `u16`)
+/// Each batch is read with a 4-byte length header (little-endian `u32`)
 /// followed by the batch data. The reader automatically handles:
 /// - Frame messages (complete messages in a single batch)
 /// - Fragment messages (parts of large messages split across batches)
@@ -743,6 +771,7 @@ pub(crate) fn receiver_builder<R>(reader: R) -> ReceiverBuilder<R> {
     ReceiverBuilder {
         capacity: 16,
         max_frag_size: 1 << 30, // 1 GiB
+        max_batch_size: MAX_BATCH_DEFAULT,
         timeout: Duration::MAX,
         reader,
     }

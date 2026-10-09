@@ -42,6 +42,7 @@ use crate::{
     Bytes, ReceiverBuilder, SenderBuilder,
     api::{receiver_builder, sender_builder},
     pipeline::tx::WriteBatch,
+    protocol::{BATCH_HEADER_BYTES, BatchSize, MAX_BATCH_DEFAULT},
     transport::{BatchReader, BatchWriter},
 };
 
@@ -52,6 +53,9 @@ pub struct Writer(Option<Driver>);
 pub struct Reader {
     driver: Option<Driver>,
     buffered: Bytes,
+    /// Largest accepted batch length; larger frames are rejected as protocol
+    /// violations. Buffering is chunk-based, so this never sizes an allocation.
+    pub(crate) max_batch: usize,
 }
 
 /// Creates an io_uring sender builder for an already connected socket.
@@ -65,18 +69,27 @@ pub fn receiver(socket: TcpStream) -> io::Result<ReceiverBuilder<Reader>> {
     Ok(receiver_builder(Reader {
         driver: Some(Driver::new(socket, Shutdown::Read)?),
         buffered: Bytes::new(),
+        max_batch: MAX_BATCH_DEFAULT,
     }))
 }
 
-async fn read_buffered(driver: &mut Driver, buffered: &mut Bytes) -> io::Result<Bytes> {
+async fn read_buffered(driver: &mut Driver, buffered: &mut Bytes, max_batch: usize) -> io::Result<Bytes> {
     loop {
-        if buffered.len() >= 2 {
-            let mut header = [0; 2];
+        if buffered.len() >= BATCH_HEADER_BYTES {
+            let mut header = [0; BATCH_HEADER_BYTES];
             buffered.reader().read_exact(&mut header)?;
-            let len = u16::from_le_bytes(header) as usize;
-            if buffered.len() >= len + 2 {
-                let batch = buffered.view(2..len + 2).expect("complete batch");
-                *buffered = buffered.view(len + 2..).expect("remaining stream");
+            let len = BatchSize::from_le_bytes(header) as usize;
+            if len > max_batch {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batch length exceeds receiver limit",
+                ));
+            }
+            if buffered.len() >= len + BATCH_HEADER_BYTES {
+                let batch = buffered
+                    .view(BATCH_HEADER_BYTES..len + BATCH_HEADER_BYTES)
+                    .expect("complete batch");
+                *buffered = buffered.view(len + BATCH_HEADER_BYTES..).expect("remaining stream");
                 return Ok(batch);
             }
         }
@@ -138,7 +151,7 @@ impl BatchWriter for Writer {
         self.0
             .as_mut()
             .ok_or_else(closed)?
-            .send(Data::Buffer(vec![0, 0]))
+            .send(Data::Buffer(vec![0; BATCH_HEADER_BYTES]))
             .await
             .map(|_| ())
     }
@@ -156,7 +169,11 @@ impl BatchReader for Reader {
         // kernel does not arm and cancel an hrtimer for every operation.
         let result = tokio::time::timeout(
             timeout,
-            read_buffered(self.driver.as_mut().ok_or_else(closed)?, &mut self.buffered),
+            read_buffered(
+                self.driver.as_mut().ok_or_else(closed)?,
+                &mut self.buffered,
+                self.max_batch,
+            ),
         )
         .await;
         match result {

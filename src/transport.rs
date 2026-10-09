@@ -3,7 +3,11 @@ use std::{future::Future, io, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{Bytes, pipeline::tx::WriteBatch, protocol::BatchSize};
+use crate::{
+    Bytes,
+    pipeline::tx::WriteBatch,
+    protocol::{BATCH_HEADER_BYTES, BatchSize},
+};
 
 pub(crate) trait BatchWriter: Send + 'static {
     fn write_batch(
@@ -47,7 +51,18 @@ pub(crate) trait BatchReader: Send + 'static {
 }
 
 pub(crate) struct TokioWriter<W>(pub(crate) W);
-pub(crate) struct TokioReader<R>(pub(crate) R);
+pub(crate) struct TokioReader<R> {
+    pub(crate) reader: R,
+    /// Largest accepted batch length; larger frames are protocol violations
+    /// and are rejected before any sized allocation.
+    max_batch: usize,
+}
+
+impl<R> TokioReader<R> {
+    pub(crate) fn new(reader: R, max_batch: usize) -> Self {
+        Self { reader, max_batch }
+    }
+}
 
 impl<W: AsyncWriteExt + Send + Unpin + 'static> BatchWriter for TokioWriter<W> {
     async fn write_batch(&mut self, batch: WriteBatch, _timeout: Duration) -> io::Result<(WriteBatch, usize)> {
@@ -66,17 +81,24 @@ impl<W: AsyncWriteExt + Send + Unpin + 'static> BatchWriter for TokioWriter<W> {
         self.0.write_all(&BatchSize::MIN.to_le_bytes()).await
     }
 }
-
 impl<R: AsyncReadExt + Send + Unpin + 'static> BatchReader for TokioReader<R> {
     async fn read_batch(&mut self, timeout: Duration) -> io::Result<Bytes> {
-        let mut header = [0; 2];
-        tokio::time::timeout(timeout, self.0.read_exact(&mut header)).await??;
+        let mut header = [0; BATCH_HEADER_BYTES];
+        tokio::time::timeout(timeout, self.reader.read_exact(&mut header)).await??;
         let len = BatchSize::from_le_bytes(header) as usize;
         if len == 0 {
             return Ok(Bytes::new());
         }
+        // Reject oversized frames before allocating; the length prefix is
+        // untrusted network input.
+        if len > self.max_batch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "batch length exceeds receiver limit",
+            ));
+        }
         let mut buf = vec![0; len.next_power_of_two()];
-        tokio::time::timeout(timeout, self.0.read_exact(&mut buf[..len])).await??;
+        tokio::time::timeout(timeout, self.reader.read_exact(&mut buf[..len])).await??;
         buf.truncate(len);
         Ok(Bytes::from(buf))
     }

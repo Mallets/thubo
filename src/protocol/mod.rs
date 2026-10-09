@@ -11,7 +11,15 @@ pub(crate) use frame::*;
 pub(crate) type FrameSn = u32;
 
 /// Size of a message batch.
-pub(crate) type BatchSize = u16;
+pub(crate) type BatchSize = u32;
+
+/// Wire size of the little-endian batch length prefix.
+pub(crate) const BATCH_HEADER_BYTES: usize = std::mem::size_of::<BatchSize>();
+
+/// Default receiver-side limit for an accepted batch length. Guards
+/// allocations against untrusted 32-bit length prefixes; the sender's
+/// `batch_size` must not exceed the receiver's `max_batch_size`.
+pub(crate) const MAX_BATCH_DEFAULT: usize = 16 * 1024 * 1024;
 
 pub(crate) mod id {
     /// Number of bits used for message type identification.

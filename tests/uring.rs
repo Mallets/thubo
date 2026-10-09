@@ -211,15 +211,83 @@ async fn native_keep_alive() {
     task.set_keep_alive(Duration::from_millis(10));
     let mut peer = tokio_socket(peer);
     for _ in 0..2 {
-        let mut header = [1; 2];
+        let mut header = [1; 4];
         tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut header))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(header, [0, 0]);
+        assert_eq!(header, [0, 0, 0, 0]);
     }
     sender.stop().await;
     drop(task.stop().await.unwrap());
+}
+
+#[tokio::test]
+async fn batches_larger_than_the_128k_recv_buffer_are_delivered() {
+    if !available() {
+        return;
+    }
+    let (tx, rx) = sockets();
+    // A 32-bit batch length allows single frames beyond the old 64 KiB cap;
+    // this one spans multiple 128 KiB receive buffers.
+    let (mut sender, task) = thubo::uring::sender(tx)
+        .unwrap()
+        .batch_size(256 * 1024)
+        .timeout(Duration::from_secs(5))
+        .build_uring();
+    let (mut receiver, reader_task) = thubo::uring::receiver(rx).unwrap().build_uring();
+    let payload = Bytes::from(vec![5; 200_000]);
+    sender.send(&payload).await.unwrap();
+    sender.stop().await;
+    let (received, _) = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.len(), 200_000);
+    assert_eq!(received.to_vec(), vec![5; 200_000]);
+    receiver.stop().await;
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), task.stop())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), reader_task.stop())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn oversized_batches_are_rejected_before_sized_allocation() {
+    if !available() {
+        return;
+    }
+    let (tx, rx) = sockets();
+    let (mut sender, task) = thubo::uring::sender(tx)
+        .unwrap()
+        .batch_size(8192)
+        .timeout(Duration::from_secs(5))
+        .build_uring();
+    let (mut receiver, reader_task) = thubo::uring::receiver(rx).unwrap().max_batch_size(4096).build_uring();
+    // One 4096-byte message already exceeds the receiver's limit once framed.
+    sender.send(&Bytes::from(vec![3; 4096])).await.unwrap();
+    sender.stop().await;
+    // The receiver must reject the frame and terminate rather than allocate.
+    let received = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await;
+    assert!(
+        received.map(|result| result.is_err()).unwrap_or(false),
+        "oversized batch must not be delivered",
+    );
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), task.stop())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    drop(reader_task.stop().await.unwrap());
 }
 
 #[tokio::test]
