@@ -306,6 +306,10 @@ pub mod collections;
 mod pipeline;
 mod protocol;
 mod sync;
+mod transport;
+
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+pub mod uring;
 
 pub use api::*;
 pub use buffers::{bytes::*, chunk::*};

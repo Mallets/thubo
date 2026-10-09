@@ -3,6 +3,17 @@ name = "thubo-bench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+io-uring = ["thubo/io-uring"]
+
+[[bin]]
+name = "thr_uring_send"
+required-features = ["io-uring"]
+
+[[bin]]
+name = "thr_uring_recv"
+required-features = ["io-uring"]
+
 [dependencies]
 clap = { version = "4.5.54", features = ["derive"] }
 quanta = { version = "0.12.6" }

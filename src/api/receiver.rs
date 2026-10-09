@@ -61,13 +61,14 @@ use tokio::{io::AsyncReadExt, select, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    buffers::{Bytes, Chunk},
+    buffers::Bytes,
     pipeline::{
         self,
         rx::{PipelineRxIn, PipelineRxOut, PullConfig, PushConfig, RecvError, SendError},
     },
-    protocol::{BatchSize, core::QoS},
+    protocol::core::QoS,
     sync::AtomicDuration,
+    transport::{BatchReader, TokioReader},
 };
 
 // ================================================================================================
@@ -133,7 +134,7 @@ impl ReceiverTaskInner {
 pub struct ReceiverStats {
     /// Number of batches successfully received.
     pub batches: usize,
-    /// Total bytes successfully received.
+    /// Total framed bytes successfully received, including the batch length prefix.
     pub bytes: usize,
     /// Number of messages/batches dropped.
     pub dropped: usize,
@@ -470,20 +471,14 @@ impl Receiver {
 ///
 /// - **capacity**: Maximum number of messages that can be buffered per priority level (default: 16)
 /// - **max_frag_size**: Maximum size of a message fragment in bytes (default: 1GiB)
-pub struct ReceiverBuilder<R>
-where
-    R: AsyncReadExt + Send + Sync + Unpin + 'static,
-{
+pub struct ReceiverBuilder<R> {
     capacity: usize,
     timeout: Duration,
     max_frag_size: usize,
     reader: R,
 }
 
-impl<R> ReceiverBuilder<R>
-where
-    R: AsyncReadExt + Send + Sync + Unpin + 'static,
-{
+impl<R> ReceiverBuilder<R> {
     /// Sets the maximum number of messages that can be buffered per priority level.
     ///
     /// Default: 16 messages per priority level
@@ -553,7 +548,19 @@ where
     /// - A read timeout occurs
     /// - The task is explicitly stopped via [`ReceiverTask::stop()`]
     #[must_use]
-    pub fn build(self) -> (Receiver, ReceiverTask<R>) {
+    pub fn build(self) -> (Receiver, ReceiverTask<R>)
+    where
+        R: AsyncReadExt + Send + Sync + Unpin + 'static,
+    {
+        self.build_with(|pipeline, reader, inner, token| {
+            tokio::spawn(async move { read_task(pipeline, TokioReader(reader), inner, token).await.0 })
+        })
+    }
+
+    fn build_with(
+        self,
+        spawn: impl FnOnce(PipelineRxIn, R, Arc<ReceiverTaskInner>, CancellationToken) -> JoinHandle<R>,
+    ) -> (Receiver, ReceiverTask<R>) {
         let Self {
             capacity,
             max_frag_size,
@@ -578,7 +585,7 @@ where
         let (sender, receiver) = pipeline::rx::pipeline_rx(capacity);
 
         // Spawn the background reader task
-        let handle = tokio::spawn(read_task(sender, reader, c_inner, c_token));
+        let handle = spawn(sender, reader, c_inner, c_token);
 
         let receiver = Receiver {
             inner: receiver,
@@ -590,6 +597,15 @@ where
     }
 }
 
+#[cfg(all(feature = "io-uring", target_os = "linux"))]
+impl ReceiverBuilder<crate::uring::Reader> {
+    /// Builds a receiver using the owned-buffer io_uring transport.
+    #[must_use]
+    pub fn build_uring(self) -> (Receiver, ReceiverTask<crate::uring::Reader>) {
+        self.build_with(|pipeline, reader, inner, token| tokio::spawn(read_task(pipeline, reader, inner, token)))
+    }
+}
+
 async fn read_task<R>(
     mut sender: PipelineRxIn,
     mut reader: R,
@@ -597,62 +613,34 @@ async fn read_task<R>(
     token: CancellationToken,
 ) -> R
 where
-    R: AsyncReadExt + Send + Sync + Unpin + 'static,
+    R: BatchReader,
 {
     // Main reception loop
     loop {
         let read_timeout = inner.timeout_read.load(Ordering::Relaxed);
 
-        // Helper macro for reading with timeout and cancellation support
-        macro_rules! read_all {
-            ($buff:expr) => {{
-                let res = select! {
-                    // Try to read with timeout
-                    res = tokio::time::timeout(read_timeout, reader.read_exact($buff)) => res,
-                    // Check if shutdown was requested
-                    _ = token.cancelled() => break,
-                };
-                match res {
-                    Ok(Ok(read)) if read == 0 => break, // EOF - connection closed
-                    Ok(Err(_)) | Err(_) => break,       // Network error or timeout
-                    _ => {}
-                }
-            }};
-        }
-
-        // Read the 2-byte length header (little-endian)
-        let mut len = BatchSize::MIN.to_le_bytes();
-        read_all!(&mut len);
-        let len = BatchSize::from_le_bytes(len) as usize;
+        let res = select! {
+            res = reader.read_batch(read_timeout) => res,
+            _ = token.cancelled() => break,
+        };
+        let Ok(buf) = res else { break };
+        let len = buf.len();
         if len == 0 {
-            continue; // Empty batch - skip
+            continue;
         }
-
-        // Allocate buffer with next power of two to reduce memory fragmentation
-        let mut buf = vec![0u8; len.next_power_of_two()];
-        // Read the batch data
-        read_all!(&mut buf[..len]);
 
         // Update statistics
         #[cfg(feature = "stats")]
         {
             inner.stats.batches_count.fetch_add(1, Ordering::Relaxed);
-            inner.stats.bytes_count.fetch_add(len, Ordering::Relaxed);
+            inner.stats.bytes_count.fetch_add(len + 2, Ordering::Relaxed);
         }
 
-        let res = sender
-            .push(
-                Bytes::single(unsafe {
-                    // SAFETY: The invariants for `Chunk::new_unchecked` are satisfied:
-                    // 1. start (0) <= end (len): trivially true since len >= 0
-                    // 2. end (len) <= buf.len(): buf is allocated with size len.next_power_of_two() which is >= len,
-                    //    ensuring the range [0..len] is within bounds
-                    // 3. The data in buf[0..len] has been initialized by the read_all! macro above
-                    Chunk::new_unchecked(Arc::new(buf), 0, len)
-                }),
-                &inner.push_config(),
-            )
-            .await;
+        let config = inner.push_config();
+        let res = select! {
+            res = sender.push(buf, &config) => res,
+            _ = token.cancelled() => break,
+        };
 
         // Handle send result
         match res {
@@ -675,7 +663,7 @@ where
         }
     }
 
-    // Return the underlying reader
+    reader.cancel();
     reader
 }
 
@@ -748,6 +736,10 @@ pub fn receiver<R>(reader: R) -> ReceiverBuilder<R>
 where
     R: AsyncReadExt + Send + Sync + Unpin + 'static,
 {
+    receiver_builder(reader)
+}
+
+pub(crate) fn receiver_builder<R>(reader: R) -> ReceiverBuilder<R> {
     ReceiverBuilder {
         capacity: 16,
         max_frag_size: 1 << 30, // 1 GiB

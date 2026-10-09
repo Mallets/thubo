@@ -760,6 +760,36 @@ impl PipelineTxOut {
         self.stage_out.refill(batch);
     }
 
+    /// Pulls one already-completed batch without waiting. Partially filled
+    /// ("booked") batches are left for [`PipelineTxOut::pull`], preserving its
+    /// batching-timeout logic; this only returns work that is fully ready.
+    /// Used to coalesce multiple ready batches into a single transport write.
+    pub(crate) fn try_pull(&mut self) -> Option<WriteBatch> {
+        if self.stage_in.status.any(status::DISABLED) {
+            return None;
+        }
+        for p in Priority::ALL {
+            match self.stage_out.ringbuf_inout_r.pull_priority(p) {
+                Pull::Some(mut batch) => {
+                    let cf = status::congested(batch.qos.priority());
+                    let is_congested = status::any(self.stage_in.status.unset(cf), cf);
+
+                    if (is_congested && batch.qos.congestion_control() == CongestionControl::Drop)
+                        || batch.drop.as_ref().is_some_and(|df| df.load(Ordering::Relaxed))
+                    {
+                        self.stage_out.refill(batch);
+                        continue;
+                    }
+
+                    batch.write_len();
+                    return Some(batch);
+                }
+                Pull::Booked | Pull::None => {}
+            }
+        }
+        None
+    }
+
     pub(crate) async fn drain(&mut self) -> Vec<WriteBatch> {
         let mut batches = vec![];
 
@@ -775,8 +805,9 @@ impl PipelineTxOut {
             si.flush();
         }
 
-        while let Some(b) = self.stage_out.ringbuf_inout_r.pull() {
-            batches.push(b);
+        while let Some(mut batch) = self.stage_out.ringbuf_inout_r.pull() {
+            batch.write_len();
+            batches.push(batch);
         }
 
         batches

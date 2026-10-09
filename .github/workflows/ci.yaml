@@ -32,6 +32,9 @@ jobs:
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check benchmark binaries
+        run: cargo clippy --manifest-path bench/Cargo.toml --all-targets --all-features -- -D warnings
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -83,7 +86,9 @@ jobs:
         uses: taiki-e/install-action@taplo
 
       - name: Check formatting (cargo fmt)
-        run: cargo +nightly fmt --all --check
+        run: |
+          cargo +nightly fmt --all --check
+          cargo +nightly fmt --manifest-path bench/Cargo.toml --all --check
 
       - name: Check unused dependencies (cargo machete)
         run: cargo machete

@@ -11,6 +11,7 @@ description = "Thubo: a high-performance TX/RX network pipeline featuring strict
 
 [features]
 stats = []
+io-uring = ["dep:io-uring", "dep:libc"]
 
 [dependencies]
 async-mutex = { version = "1.4.0" }
@@ -28,6 +29,10 @@ tokio = { version = "1.49.0", features = [
   "io-util",
 ] }
 tokio-util = { version = "0.7.18" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.15", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 clap = { version = "4.5.54", features = ["derive"] }
