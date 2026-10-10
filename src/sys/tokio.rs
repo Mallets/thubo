@@ -1,59 +1,15 @@
-//! Internal owned-batch boundary shared by the sender and receiver tasks.
-use std::{future::Future, io, io::IoSlice, time::Duration};
+use std::{io::{self, IoSlice}, time::Duration};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{Bytes, pipeline::tx::WriteBatch, protocol::BatchSize};
+use crate::{Bytes, pipeline::{BatchReader, BatchWriter, tx::WriteBatch}, protocol::BatchSize};
 
-pub(crate) trait BatchWriter: Send + 'static {
-    fn write_batch(
-        &mut self,
-        batch: WriteBatch,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<(WriteBatch, usize)>> + Send;
-
-    /// Writes multiple already-ready batches, ideally within a single
-    /// vectored write. Batches stay in the given order. The default
-    /// implementation writes them sequentially via [`BatchWriter::write_batch`].
-    fn write_batches(
-        &mut self,
-        batches: Vec<WriteBatch>,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<(Vec<WriteBatch>, usize)>> + Send {
-        async move {
-            let mut written = 0;
-            let mut done = Vec::with_capacity(batches.len());
-            for batch in batches {
-                let (batch, n) = self.write_batch(batch, timeout).await?;
-                written += n;
-                done.push(batch);
-            }
-            Ok((done, written))
-        }
-    }
-
-    fn keep_alive(&mut self, timeout: Duration) -> impl Future<Output = io::Result<()>> + Send;
-
-    // Writers that must interrupt or reap in-flight data after an outer
-    // write timeout override this. The Tokio writer needs no cleanup.
-    fn cancel(&mut self) {}
-}
-
-pub(crate) trait BatchReader: Send + 'static {
-    // An empty buffer is a keep-alive. EOF is an UnexpectedEof error.
-    fn read_batch(&mut self, timeout: Duration) -> impl Future<Output = io::Result<Bytes>> + Send;
-
-    // Readers that must interrupt outstanding reads on cancellation
-    // override this. The Tokio reader needs no cleanup.
-    fn cancel(&mut self) {}
-}
 
 pub(crate) struct TokioWriter<W>(pub(crate) W);
-pub(crate) struct TokioReader<R>(pub(crate) R);
 
 impl<W: AsyncWriteExt + Send + Unpin + 'static> TokioWriter<W> {
     /// Linux limits a single writev to IOV_MAX (1024) iovecs.
-    const MAX_IOV: usize = 1024;
+    const MAX_IOV: usize = 1_024;
 
     /// Writes every slice with vectored writes, looping over partial writes.
     /// Writers without vectored support (e.g. TLS wrappers) transparently
@@ -121,11 +77,17 @@ impl<W: AsyncWriteExt + Send + Unpin + 'static> BatchWriter for TokioWriter<W> {
     async fn keep_alive(&mut self, _timeout: Duration) -> io::Result<()> {
         self.0.write_all(&BatchSize::MIN.to_le_bytes()).await
     }
+
+    fn cancel(&mut self) {
+        // Tokio writers are cancellation safe.
+    }
 }
+
+pub(crate) struct TokioReader<R>(pub(crate) R);
 
 impl<R: AsyncReadExt + Send + Unpin + 'static> BatchReader for TokioReader<R> {
     async fn read_batch(&mut self, timeout: Duration) -> io::Result<Bytes> {
-        let mut header = [0; 2];
+        let mut header = BatchSize::MIN.to_le_bytes();
         tokio::time::timeout(timeout, self.0.read_exact(&mut header)).await??;
         let len = BatchSize::from_le_bytes(header) as usize;
         if len == 0 {

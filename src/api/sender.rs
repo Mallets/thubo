@@ -24,12 +24,12 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     buffers::Bytes,
     pipeline::{
-        status,
+        status,BatchWriter,
         tx::{PipelineTxIn, PipelineTxOut, PullConfig, PushConfig, SendError},
     },
     protocol::{BatchSize, QoS},
     sync::AtomicDuration,
-    transport::{BatchWriter, TokioWriter},
+    sys::tokio::TokioWriter,
 };
 
 /// High-level sender for transmitting messages over the network.
@@ -430,17 +430,17 @@ impl<W> SenderTask<W> {
 ///
 /// This builder allows you to customize the reception pipeline parameters before
 /// spawning the background task that handles network I/O and message reassembly.
-pub struct SenderBuilder<R> {
+pub struct SenderBuilder<W> {
     qos: QoS,
     capacity: usize,
     batch_size: BatchSize,
     timeout: Duration,
     timeout_progress: Duration,
     timeout_batch: Duration,
-    writer: R,
+    writer: W,
 }
 
-impl<R> SenderBuilder<R> {
+impl<W> SenderBuilder<W> {
     /// Sets the QoS paramters.
     #[must_use]
     pub fn qos(mut self, qos: QoS) -> Self {
@@ -547,9 +547,9 @@ impl<R> SenderBuilder<R> {
     /// - A read timeout occurs
     /// - The task is explicitly stopped via [`SenderTask::stop()`]
     #[must_use]
-    pub fn build(self) -> (Sender, SenderTask<R>)
+    pub fn build(self) -> (Sender, SenderTask<W>)
     where
-        R: AsyncWriteExt + Send + Sync + Unpin + 'static,
+        W: AsyncWriteExt + Send + Sync + Unpin + 'static,
     {
         self.build_with(|pipeline, writer, inner, token| {
             tokio::spawn(async move { write_task(pipeline, TokioWriter(writer), inner, token).await.0 })
@@ -558,8 +558,8 @@ impl<R> SenderBuilder<R> {
 
     fn build_with(
         self,
-        spawn: impl FnOnce(PipelineTxOut, R, Arc<SenderTaskInner>, CancellationToken) -> JoinHandle<R>,
-    ) -> (Sender, SenderTask<R>) {
+        spawn: impl FnOnce(PipelineTxOut, W, Arc<SenderTaskInner>, CancellationToken) -> JoinHandle<W>,
+    ) -> (Sender, SenderTask<W>) {
         let Self {
             qos,
             capacity,
@@ -609,14 +609,14 @@ async fn write_task<W>(
 where
     W: BatchWriter,
 {
-    const COALESCE_MAX_BYTES: usize = 512 * 1024;
+    const COALESCE_MAX_BYTES: usize = 512 * 1_024;
     const COALESCE_MAX_BATCHES: usize = 8;
 
     // Helper macro for writing data to the network with timeout protection
     macro_rules! write_batches {
         ($batches:expr) => {{
             let batches = $batches;
-            
+
             #[cfg(feature = "stats")]
             let count = batches.len();
 
@@ -655,8 +655,9 @@ where
                     Some(first) => {
                         // Coalesce batches that are already complete without
                         // waiting for more; ordering and backpressure are unchanged.
-                        let mut batches = vec![first];
-                        let mut bytes = batches[0].len() as usize;
+                        let mut bytes = first.len() as usize;
+                        let mut batches = Vec::with_capacity(COALESCE_MAX_BATCHES);
+                        batches.push(first);
                         while batches.len() < COALESCE_MAX_BATCHES && bytes < COALESCE_MAX_BYTES {
                             match pipeline_out.try_pull() {
                                 Some(batch) => {
@@ -732,7 +733,7 @@ where
     SenderBuilder {
         qos: QoS::DEFAULT,
         capacity: 16,
-        batch_size: 65_535,
+        batch_size: BatchSize::MAX,
         timeout: Duration::from_secs(60),
         timeout_progress: Duration::from_secs(10),
         timeout_batch: Duration::from_micros(100),
