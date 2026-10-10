@@ -616,7 +616,10 @@ where
     macro_rules! write_batches {
         ($batches:expr) => {{
             let batches = $batches;
+            
+            #[cfg(feature = "stats")]
             let count = batches.len();
+
             let timeout = inner.write_timeout.load(Ordering::Relaxed);
             match tokio::time::timeout(timeout, writer.write_batches(batches, timeout)).await {
                 Ok(Ok((batches, written))) => {

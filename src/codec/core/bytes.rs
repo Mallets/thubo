@@ -31,12 +31,14 @@ where
         if len == 0 {
             return Ok(Bytes::new());
         }
+
         // Fast path: the payload lies within the reader's current contiguous
         // chunk. A single zero-copy view avoids the per-chunk iterator and
         // buffer-list push for the overwhelmingly common case.
-        if len <= reader.contiguous_remaining() {
-            return Ok(Bytes::single(reader.read_chunk(len)?));
+        if let Ok(chunk) = reader.read_chunk_contiguous(len) {
+            return Ok(Bytes::single(chunk));
         }
+
         let mut bytes = Bytes::new();
         reader.read_chunks(len, |s| bytes.push(s))?;
         Ok(bytes)

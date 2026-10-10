@@ -543,6 +543,10 @@ impl Reader for &mut Chunk {
         Ok(res)
     }
 
+    fn read_chunk_contiguous(&mut self, len: usize) -> Result<Chunk, DidntRead> {
+        self.read_chunk(len)
+    }
+
     fn remaining(&self) -> usize {
         self.len()
     }
