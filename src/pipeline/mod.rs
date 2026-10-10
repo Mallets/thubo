@@ -1,9 +1,14 @@
-use crate::{Bytes, pipeline::tx::WriteBatch};
+use std::{
+    future::Future,
+    io,
+    sync::{
+        LazyLock,
+        atomic::{AtomicU16, Ordering},
+    },
+    time::Duration,
+};
 
-use std::{future::Future, io, time::Duration,sync::{
-    LazyLock,
-    atomic::{AtomicU16, Ordering},
-}};
+use crate::{Bytes, pipeline::tx::WriteBatch};
 
 pub(super) mod ringbuf;
 pub(crate) mod rx;
@@ -53,7 +58,6 @@ impl Status {
         status::any(self.0.load(Ordering::Acquire), f)
     }
 }
-
 
 pub(crate) trait BatchWriter: Send + 'static {
     fn write_batch(

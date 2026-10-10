@@ -599,9 +599,7 @@ impl Reader for BytesReader<'_> {
     fn read_chunk_contiguous(&mut self, len: usize) -> Result<Chunk, DidntRead> {
         let slice = self.inner.chunks.get(self.cursor.slice).ok_or(DidntRead)?;
         match (slice.len() - self.cursor.byte).cmp(&len) {
-            cmp::Ordering::Less => {
-                Err(DidntRead)
-            }
+            cmp::Ordering::Less => Err(DidntRead),
             cmp::Ordering::Equal => {
                 let s = slice.view(self.cursor.byte..).ok_or(DidntRead)?;
                 self.cursor.slice += 1;

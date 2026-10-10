@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     buffers::Bytes,
     pipeline::{
-        status,BatchWriter,
+        BatchWriter, status,
         tx::{PipelineTxIn, PipelineTxOut, PullConfig, PushConfig, SendError},
     },
     protocol::{BatchSize, QoS},

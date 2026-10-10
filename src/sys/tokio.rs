@@ -1,9 +1,15 @@
-use std::{io::{self, IoSlice}, time::Duration};
+use std::{
+    io::{self, IoSlice},
+    time::Duration,
+};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{Bytes, pipeline::{BatchReader, BatchWriter, tx::WriteBatch}, protocol::BatchSize};
-
+use crate::{
+    Bytes,
+    pipeline::{BatchReader, BatchWriter, tx::WriteBatch},
+    protocol::BatchSize,
+};
 
 pub(crate) struct TokioWriter<W>(pub(crate) W);
 
