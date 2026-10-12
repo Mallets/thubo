@@ -303,6 +303,7 @@ mod api;
 mod buffers;
 mod codec;
 pub mod collections;
+mod io;
 mod pipeline;
 mod protocol;
 mod sync;

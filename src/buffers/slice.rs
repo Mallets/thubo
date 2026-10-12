@@ -97,9 +97,13 @@ impl Reader for &[u8] {
     }
 
     fn read_chunk(&mut self, len: usize) -> Result<Chunk, DidntRead> {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = vec![0u8; len].into_boxed_slice();
         self.read_exact(&mut buffer)?;
         Ok(buffer.into())
+    }
+
+    fn read_chunk_contiguous(&mut self, len: usize) -> Result<Chunk, DidntRead> {
+        self.read_chunk(len)
     }
 
     fn remaining(&self) -> usize {

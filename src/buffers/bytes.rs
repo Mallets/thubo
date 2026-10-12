@@ -578,7 +578,7 @@ impl Reader for BytesReader<'_> {
         let slice = self.inner.chunks.get(self.cursor.slice).ok_or(DidntRead)?;
         match (slice.len() - self.cursor.byte).cmp(&len) {
             cmp::Ordering::Less => {
-                let mut buffer = vec![0u8; len];
+                let mut buffer = vec![0u8; len].into_boxed_slice();
                 Reader::read_exact(self, &mut buffer)?;
                 Ok(buffer.into())
             }
@@ -592,6 +592,28 @@ impl Reader for BytesReader<'_> {
                 let start = self.cursor.byte;
                 self.cursor.byte += len;
                 slice.view(start..self.cursor.byte).ok_or(DidntRead)
+            }
+        }
+    }
+
+    fn read_chunk_contiguous(&mut self, len: usize) -> Result<Chunk, DidntRead> {
+        let slice = self.inner.chunks.get(self.cursor.slice).ok_or(DidntRead)?;
+        match (slice.len() - self.cursor.byte).cmp(&len) {
+            cmp::Ordering::Less => Err(DidntRead),
+            cmp::Ordering::Equal => {
+                let s = slice.view(self.cursor.byte..).ok_or(DidntRead)?;
+                self.cursor.slice += 1;
+                self.cursor.byte = 0;
+                Ok(s)
+            }
+            cmp::Ordering::Greater => {
+                // Build the view before advancing the cursor so that a failed
+                // view cannot desynchronize the reader for the fallback path.
+                let start = self.cursor.byte;
+                let end = start + len;
+                let chunk = slice.view(start..end).ok_or(DidntRead)?;
+                self.cursor.byte = end;
+                Ok(chunk)
             }
         }
     }

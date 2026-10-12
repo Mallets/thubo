@@ -29,6 +29,9 @@ tokio = { version = "1.49.0", features = [
 ] }
 tokio-util = { version = "0.7.18" }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 clap = { version = "4.5.54", features = ["derive"] }
 pollster = { version = "0.3.0" }

@@ -28,6 +28,17 @@ where
 
     fn read(self, reader: &mut R) -> Result<Bytes, Self::Error> {
         let len: usize = self.read(&mut *reader)?;
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+
+        // Fast path: the payload lies within the reader's current contiguous
+        // chunk. A single zero-copy view avoids the per-chunk iterator and
+        // buffer-list push for the overwhelmingly common case.
+        if let Ok(chunk) = reader.read_chunk_contiguous(len) {
+            return Ok(Bytes::single(chunk));
+        }
+
         let mut bytes = Bytes::new();
         reader.read_chunks(len, |s| bytes.push(s))?;
         Ok(bytes)

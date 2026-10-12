@@ -215,6 +215,16 @@ pub(crate) mod reader {
         /// Returns `DidntRead` if the buffer has insufficient data.
         fn read_chunk(&mut self, len: usize) -> Result<Chunk, DidntRead>;
 
+        /// Reads exactly `len` bytes, returning them as a single `Chunk`.
+        ///
+        /// This enables zero-copy reading when the underlying buffer supports
+        /// it.
+        ///
+        /// # Errors
+        ///
+        /// Returns `DidntRead` if the buffer has insufficient data or the data is not contiguous.
+        fn read_chunk_contiguous(&mut self, len: usize) -> Result<Chunk, DidntRead>;
+
         /// Reads a single byte from the buffer.
         ///
         /// # Errors
