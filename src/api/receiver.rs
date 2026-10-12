@@ -62,13 +62,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffers::Bytes,
+    io::{BatchReader, TokioReader},
     pipeline::{
-        self, BatchReader,
+        self,
         rx::{PipelineRxIn, PipelineRxOut, PullConfig, PushConfig, RecvError, SendError},
     },
     protocol::core::QoS,
     sync::AtomicDuration,
-    sys::tokio::TokioReader,
 };
 
 // ================================================================================================

@@ -23,13 +23,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffers::Bytes,
+    io::{BatchWriter, TokioWriter},
     pipeline::{
-        BatchWriter, status,
+        status,
         tx::{PipelineTxIn, PipelineTxOut, PullConfig, PushConfig, SendError},
     },
     protocol::{BatchSize, QoS},
     sync::AtomicDuration,
-    sys::tokio::TokioWriter,
 };
 
 /// High-level sender for transmitting messages over the network.

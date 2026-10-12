@@ -1,14 +1,7 @@
-use std::{
-    future::Future,
-    io,
-    sync::{
-        LazyLock,
-        atomic::{AtomicU16, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicU16, Ordering},
 };
-
-use crate::{Bytes, pipeline::tx::WriteBatch};
 
 pub(super) mod ringbuf;
 pub(crate) mod rx;
@@ -57,47 +50,4 @@ impl Status {
     pub(crate) fn any(&self, f: u16) -> bool {
         status::any(self.0.load(Ordering::Acquire), f)
     }
-}
-
-pub(crate) trait BatchWriter: Send + 'static {
-    fn write_batch(
-        &mut self,
-        batch: WriteBatch,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<(WriteBatch, usize)>> + Send;
-
-    /// Writes multiple already-ready batches, ideally within a single
-    /// vectored write. Batches stay in the given order. The default
-    /// implementation writes them sequentially via [`BatchWriter::write_batch`].
-    fn write_batches(
-        &mut self,
-        batches: Vec<WriteBatch>,
-        timeout: Duration,
-    ) -> impl Future<Output = io::Result<(Vec<WriteBatch>, usize)>> + Send {
-        async move {
-            let mut written = 0;
-            let mut done = Vec::with_capacity(batches.len());
-            for batch in batches {
-                let (batch, n) = self.write_batch(batch, timeout).await?;
-                written += n;
-                done.push(batch);
-            }
-            Ok((done, written))
-        }
-    }
-
-    fn keep_alive(&mut self, timeout: Duration) -> impl Future<Output = io::Result<()>> + Send;
-
-    // Writers that must interrupt or reap in-flight data after an outer
-    // write timeout override this.
-    fn cancel(&mut self);
-}
-
-pub(crate) trait BatchReader: Send + 'static {
-    // An empty buffer is a keep-alive. EOF is an UnexpectedEof error.
-    fn read_batch(&mut self, timeout: Duration) -> impl Future<Output = io::Result<Bytes>> + Send;
-
-    // Readers that must interrupt outstanding reads on cancellation
-    // override this. The Tokio reader needs no cleanup.
-    fn cancel(&mut self) {}
 }
