@@ -607,9 +607,13 @@ impl Reader for BytesReader<'_> {
                 Ok(s)
             }
             cmp::Ordering::Greater => {
+                // Build the view before advancing the cursor so that a failed
+                // view cannot desynchronize the reader for the fallback path.
                 let start = self.cursor.byte;
-                self.cursor.byte += len;
-                slice.view(start..self.cursor.byte).ok_or(DidntRead)
+                let end = start + len;
+                let chunk = slice.view(start..end).ok_or(DidntRead)?;
+                self.cursor.byte = end;
+                Ok(chunk)
             }
         }
     }

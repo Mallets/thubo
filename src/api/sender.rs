@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffers::Bytes,
+    collections::SingleOrVec,
     io::{BatchWriter, TokioWriter},
     pipeline::{
         status,
@@ -609,7 +610,6 @@ async fn write_task<W>(
 where
     W: BatchWriter,
 {
-    const COALESCE_MAX_BYTES: usize = 512 * 1_024;
     const COALESCE_MAX_BATCHES: usize = 8;
 
     // Helper macro for writing data to the network with timeout protection
@@ -654,16 +654,13 @@ where
                 Ok(batch) => match batch {
                     Some(first) => {
                         // Coalesce batches that are already complete without
-                        // waiting for more; ordering and backpressure are unchanged.
-                        let mut bytes = first.len() as usize;
-                        let mut batches = Vec::with_capacity(COALESCE_MAX_BATCHES);
-                        batches.push(first);
-                        while batches.len() < COALESCE_MAX_BATCHES && bytes < COALESCE_MAX_BYTES {
+                        // waiting for more; ordering and backpressure are
+                        // unchanged. The common no-coalescing case stays
+                        // allocation-free via SingleOrVec.
+                        let mut batches = SingleOrVec::single(first);
+                        while batches.len() < COALESCE_MAX_BATCHES {
                             match pipeline_out.try_pull() {
-                                Some(batch) => {
-                                    bytes += batch.len() as usize;
-                                    batches.push(batch);
-                                }
+                                Some(batch) => batches.push(batch),
                                 None => break,
                             }
                         }
@@ -706,7 +703,7 @@ where
 
     // Graceful shutdown: drain and transmit remaining batches
     for batch in pipeline_out.drain().await.drain(..) {
-        let Ok(_) = write_batches!(vec![batch]) else {
+        let Ok(_) = write_batches!(SingleOrVec::single(batch)) else {
             break; // Stop on first error during drain
         };
     }

@@ -6,7 +6,7 @@ use std::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{Bytes, pipeline::tx::WriteBatch, protocol::BatchSize};
+use crate::{Bytes, collections::SingleOrVec, pipeline::tx::WriteBatch, protocol::BatchSize};
 
 pub(crate) trait BatchWriter: Send + 'static {
     fn write_batch(
@@ -20,12 +20,12 @@ pub(crate) trait BatchWriter: Send + 'static {
     /// implementation writes them sequentially via [`BatchWriter::write_batch`].
     fn write_batches(
         &mut self,
-        batches: Vec<WriteBatch>,
+        batches: SingleOrVec<WriteBatch>,
         timeout: Duration,
-    ) -> impl Future<Output = io::Result<(Vec<WriteBatch>, usize)>> + Send {
+    ) -> impl Future<Output = io::Result<(SingleOrVec<WriteBatch>, usize)>> + Send {
         async move {
             let mut written = 0;
-            let mut done = Vec::with_capacity(batches.len());
+            let mut done = SingleOrVec::new();
             for batch in batches {
                 let (batch, n) = self.write_batch(batch, timeout).await?;
                 written += n;
@@ -85,9 +85,10 @@ impl<W: AsyncWriteExt + Send + Unpin + 'static> TokioWriter<W> {
     /// Gathers the frame and fragment slices of every batch into one
     /// vectored write list: the length prefix, headers and payload chunks
     /// cross the socket in a single `writev(2)` instead of one syscall
-    /// per slice.
-    fn gather(batches: &[WriteBatch]) -> Vec<IoSlice<'_>> {
-        let mut slices = Vec::new();
+    /// per slice. The common single-slice case stays allocation-free via
+    /// [`SingleOrVec`].
+    fn gather(batches: &[WriteBatch]) -> SingleOrVec<IoSlice<'_>> {
+        let mut slices = SingleOrVec::new();
         for batch in batches {
             let frame = batch.frame.as_slice();
             if !frame.is_empty() {
@@ -105,23 +106,28 @@ impl<W: AsyncWriteExt + Send + Unpin + 'static> TokioWriter<W> {
 
 impl<W: AsyncWriteExt + Send + Unpin + 'static> BatchWriter for TokioWriter<W> {
     async fn write_batch(&mut self, batch: WriteBatch, timeout: Duration) -> io::Result<(WriteBatch, usize)> {
-        let (mut batches, written) = self.write_batches(vec![batch], timeout).await?;
-        Ok((batches.pop().expect("one batch in, one batch out"), written))
+        let (batches, written) = self.write_batches(SingleOrVec::single(batch), timeout).await?;
+        let batch = match batches {
+            SingleOrVec::Single(batch) => batch,
+            SingleOrVec::Vec(mut batches) => batches.pop().expect("one batch in, one batch out"),
+        };
+        Ok((batch, written))
     }
 
     async fn write_batches(
         &mut self,
-        batches: Vec<WriteBatch>,
+        batches: SingleOrVec<WriteBatch>,
         _timeout: Duration,
-    ) -> io::Result<(Vec<WriteBatch>, usize)> {
-        let mut slices = Self::gather(&batches);
-        let written = self.write_all_slices(&mut slices).await?;
+    ) -> io::Result<(SingleOrVec<WriteBatch>, usize)> {
+        let mut slices = Self::gather(batches.as_slice());
+        let written = self.write_all_slices(slices.as_mut_slice()).await?;
         self.0.flush().await?;
         Ok((batches, written))
     }
 
     async fn keep_alive(&mut self, _timeout: Duration) -> io::Result<()> {
-        self.0.write_all(&BatchSize::MIN.to_le_bytes()).await
+        self.0.write_all(&BatchSize::MIN.to_le_bytes()).await?;
+        self.0.flush().await
     }
 
     fn cancel(&mut self) {

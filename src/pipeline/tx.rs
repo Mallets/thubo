@@ -771,27 +771,30 @@ impl PipelineTxOut {
     /// batching-timeout logic; this only returns work that is fully ready.
     /// Used to coalesce multiple ready batches into a single transport write.
     pub(crate) fn try_pull(&mut self) -> Option<WriteBatch> {
-        if self.stage_in.status.any(status::DISABLED) {
-            return None;
-        }
-        for p in Priority::ALL {
-            match self.stage_out.ringbuf_inout_r.pull_priority(p) {
-                Pull::Some(mut batch) => {
-                    let cf = status::congested(batch.qos.priority());
-                    let is_congested = status::any(self.stage_in.status.unset(cf), cf);
+        // Mirrors `pull`: a batch that must be dropped restarts the scan from
+        // the highest priority, so a freshly queued higher-priority batch is
+        // never transmitted after a lower-priority one.
+        'outer: while !self.stage_in.status.any(status::DISABLED) {
+            for p in Priority::ALL {
+                match self.stage_out.ringbuf_inout_r.pull_priority(p) {
+                    Pull::Some(mut batch) => {
+                        let cf = status::congested(batch.qos.priority());
+                        let is_congested = status::any(self.stage_in.status.unset(cf), cf);
 
-                    if (is_congested && batch.qos.congestion_control() == CongestionControl::Drop)
-                        || batch.drop.as_ref().is_some_and(|df| df.load(Ordering::Relaxed))
-                    {
-                        self.stage_out.refill(batch);
-                        continue;
+                        if (is_congested && batch.qos.congestion_control() == CongestionControl::Drop)
+                            || batch.drop.as_ref().is_some_and(|df| df.load(Ordering::Relaxed))
+                        {
+                            self.stage_out.refill(batch);
+                            continue 'outer;
+                        }
+
+                        batch.write_len();
+                        return Some(batch);
                     }
-
-                    batch.write_len();
-                    return Some(batch);
+                    Pull::Booked | Pull::None => {}
                 }
-                Pull::Booked | Pull::None => {}
             }
+            return None;
         }
         None
     }

@@ -49,6 +49,9 @@
 //! # }
 //! ```
 
+#[cfg(feature = "stats")]
+use std::mem::size_of;
+
 use std::{
     sync::{
         Arc,
@@ -70,6 +73,9 @@ use crate::{
     protocol::core::QoS,
     sync::AtomicDuration,
 };
+
+#[cfg(feature = "stats")]
+use crate::protocol::BatchSize;
 
 // ================================================================================================
 // ReceiverTask - Background I/O and Defragmentation Management
@@ -624,14 +630,16 @@ where
         #[cfg(feature = "stats")]
         {
             inner.stats.batches_count.fetch_add(1, Ordering::Relaxed);
-            inner.stats.bytes_count.fetch_add(len + 2, Ordering::Relaxed);
+            inner
+                .stats
+                .bytes_count
+                .fetch_add(len + size_of::<BatchSize>(), Ordering::Relaxed);
         }
 
-        let config = inner.push_config();
-        let res = select! {
-            res = sender.push(buf, &config) => res,
-            _ = token.cancelled() => break,
-        };
+        // A batch that has been read off the wire is never dropped on
+        // cancellation: the push runs to completion, so shutdown can only
+        // lose batches that were never read.
+        let res = sender.push(buf, &inner.push_config()).await;
 
         // Handle send result
         match res {
