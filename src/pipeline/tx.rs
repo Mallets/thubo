@@ -766,14 +766,9 @@ impl PipelineTxOut {
         self.stage_out.refill(batch);
     }
 
-    /// Pulls one already-completed batch without waiting. Partially filled
-    /// ("booked") batches are left for [`PipelineTxOut::pull`], preserving its
-    /// batching-timeout logic; this only returns work that is fully ready.
-    /// Used to coalesce multiple ready batches into a single transport write.
+    /// Pulls a batch that is ready, without waiting. It stops at the first booked
+    /// batch, leaving it to [`PipelineTxOut::pull`] so priority order is preserved.
     pub(crate) fn try_pull(&mut self) -> Option<WriteBatch> {
-        // Mirrors `pull`: a batch that must be dropped restarts the scan from
-        // the highest priority, so a freshly queued higher-priority batch is
-        // never transmitted after a lower-priority one.
         'outer: while !self.stage_in.status.any(status::DISABLED) {
             for p in Priority::ALL {
                 match self.stage_out.ringbuf_inout_r.pull_priority(p) {
@@ -791,7 +786,8 @@ impl PipelineTxOut {
                         batch.write_len();
                         return Some(batch);
                     }
-                    Pull::Booked | Pull::None => {}
+                    Pull::Booked => return None,
+                    Pull::None => {}
                 }
             }
             return None;

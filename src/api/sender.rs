@@ -14,6 +14,7 @@
 #[cfg(feature = "stats")]
 use std::sync::atomic::AtomicUsize;
 use std::{
+    io::IoSlice,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -24,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     buffers::Bytes,
     collections::SingleOrVec,
-    io::{BatchWriter, TokioWriter},
     pipeline::{
         status,
         tx::{PipelineTxIn, PipelineTxOut, PullConfig, PushConfig, SendError},
@@ -431,17 +431,23 @@ impl<W> SenderTask<W> {
 ///
 /// This builder allows you to customize the reception pipeline parameters before
 /// spawning the background task that handles network I/O and message reassembly.
-pub struct SenderBuilder<W> {
+pub struct SenderBuilder<R>
+where
+    R: AsyncWriteExt + Send + Sync + Unpin + 'static,
+{
     qos: QoS,
     capacity: usize,
     batch_size: BatchSize,
     timeout: Duration,
     timeout_progress: Duration,
     timeout_batch: Duration,
-    writer: W,
+    writer: R,
 }
 
-impl<W> SenderBuilder<W> {
+impl<R> SenderBuilder<R>
+where
+    R: AsyncWriteExt + Send + Sync + Unpin + 'static,
+{
     /// Sets the QoS paramters.
     #[must_use]
     pub fn qos(mut self, qos: QoS) -> Self {
@@ -548,19 +554,7 @@ impl<W> SenderBuilder<W> {
     /// - A read timeout occurs
     /// - The task is explicitly stopped via [`SenderTask::stop()`]
     #[must_use]
-    pub fn build(self) -> (Sender, SenderTask<W>)
-    where
-        W: AsyncWriteExt + Send + Sync + Unpin + 'static,
-    {
-        self.build_with(|pipeline, writer, inner, token| {
-            tokio::spawn(async move { write_task(pipeline, TokioWriter(writer), inner, token).await.0 })
-        })
-    }
-
-    fn build_with(
-        self,
-        spawn: impl FnOnce(PipelineTxOut, W, Arc<SenderTaskInner>, CancellationToken) -> JoinHandle<W>,
-    ) -> (Sender, SenderTask<W>) {
+    pub fn build(self) -> (Sender, SenderTask<R>) {
         let Self {
             qos,
             capacity,
@@ -585,7 +579,8 @@ impl<W> SenderBuilder<W> {
         });
         let c_inner = inner.clone();
 
-        let handle = spawn(pipeline_out, writer, c_inner, c_token);
+        // Spawn the background reader task
+        let handle = tokio::spawn(write_task(pipeline_out, writer, c_inner, c_token));
 
         let sender = Sender {
             inner: pipeline_in,
@@ -608,36 +603,35 @@ async fn write_task<W>(
     token: CancellationToken,
 ) -> W
 where
-    W: BatchWriter,
+    W: AsyncWriteExt + Send + Sync + Unpin + 'static,
 {
+    // Maximum number of ready batches coalesced into a single vectored write
     const COALESCE_MAX_BATCHES: usize = 8;
 
     // Helper macro for writing data to the network with timeout protection
     macro_rules! write_batches {
-        ($batches:expr) => {{
-            let batches = $batches;
-
-            #[cfg(feature = "stats")]
-            let count = batches.len();
-
+        ($batches:ident) => {{
             let timeout = inner.write_timeout.load(Ordering::Relaxed);
-            match tokio::time::timeout(timeout, writer.write_batches(batches, timeout)).await {
-                Ok(Ok((batches, written))) => {
-                    for batch in batches {
-                        pipeline_out.refill(batch);
-                    }
-                    #[cfg(feature = "stats")]
-                    {
-                        inner.stats.batches_count.fetch_add(count, Ordering::Release);
-                        inner.stats.bytes_count.fetch_add(written, Ordering::Release);
-                    }
-                    Ok(written)
+            tokio::time::timeout(timeout, async {
+                // Gather the frame (batch size and header) and the fragment slices
+                // (the actual message data) of every batch in a single vectored write
+                let mut slices = SingleOrVec::new();
+                for batch in $batches.as_slice() {
+                    slices.push(IoSlice::new(batch.frame.as_slice()));
+                    slices.extend(batch.fragment.slices().map(IoSlice::new));
                 }
-                _ => {
-                    writer.cancel();
-                    Err(())
+                let written = write_all_vectored(&mut writer, slices.as_mut_slice()).await?;
+
+                // Flush
+                writer.flush().await?;
+
+                // Return the batch buffers to the pool for reuse
+                for batch in $batches {
+                    pipeline_out.refill(batch);
                 }
-            }
+                Ok::<usize, std::io::Error>(written)
+            })
+            .await
         }};
     }
 
@@ -651,33 +645,11 @@ where
         let res = select! {
             // Try to pull a batch with keep-alive timeout
             res = tokio::time::timeout(keep_alive, pipeline_out.pull(&config)) => match res {
-                Ok(batch) => match batch {
-                    Some(first) => {
-                        // Coalesce batches that are already complete without
-                        // waiting for more; ordering and backpressure are
-                        // unchanged. The common no-coalescing case stays
-                        // allocation-free via SingleOrVec.
-                        let mut batches = SingleOrVec::single(first);
-                        while batches.len() < COALESCE_MAX_BATCHES {
-                            match pipeline_out.try_pull() {
-                                Some(batch) => batches.push(batch),
-                                None => break,
-                            }
-                        }
-                        Some(batches)
-                    }
-                    None => None,
-                },
+                Ok(batch) => batch,
                 // Send a keep-alive (0 bytes to read)
-                Err(_) => {
-                    let timeout = inner.write_timeout.load(Ordering::Relaxed);
-                    match tokio::time::timeout(timeout, writer.keep_alive(timeout)).await {
-                        Ok(Ok(())) => continue,
-                        _ => {
-                            writer.cancel();
-                            return writer;
-                        }
-                    }
+                Err(_) => match writer.write_all(&BatchSize::MIN.to_le_bytes()).await {
+                    Ok(_) => continue,
+                    Err(_) => break,
                 },
             },
             // Check if shutdown was requested
@@ -687,29 +659,63 @@ where
         };
 
         // Handle the pull result
-        let batches = match res {
-            // Batches are available - transmit them
-            Some(batches) => batches,
+        let batch = match res {
+            // Batch is available - transmit it
+            Some(batch) => batch,
             // Pipeline is closed - exit gracefully
             None => break,
         };
 
+        // Coalesce the batches that are already ready, without waiting for more
+        let mut batches = SingleOrVec::single(batch);
+        while batches.len() < COALESCE_MAX_BATCHES {
+            let Some(batch) = pipeline_out.try_pull() else { break };
+            batches.push(batch);
+        }
+        #[cfg(feature = "stats")]
+        let count = batches.len();
+
         // Write the batches to the network
-        let Ok(_written) = write_batches!(batches) else {
-            // Never send later bytes after a partial batch failed.
-            return writer;
+        let Ok(Ok(_written)) = write_batches!(batches) else {
+            break; // Network error - terminate
         };
+
+        // Update statistics (only with `stats` feature)
+        #[cfg(feature = "stats")]
+        {
+            inner.stats.batches_count.fetch_add(count, Ordering::Release);
+            inner.stats.bytes_count.fetch_add(_written, Ordering::Release);
+        }
     }
 
     // Graceful shutdown: drain and transmit remaining batches
     for batch in pipeline_out.drain().await.drain(..) {
-        let Ok(_) = write_batches!(SingleOrVec::single(batch)) else {
+        let batches = SingleOrVec::single(batch);
+        let Ok(Ok(_)) = write_batches!(batches) else {
             break; // Stop on first error during drain
         };
     }
 
     // Return the underlying writer
     writer
+}
+
+/// Writes all the slices with vectored writes, looping over partial writes.
+/// Writers without vectored support fall back to one slice per write.
+async fn write_all_vectored<W>(writer: &mut W, mut slices: &mut [IoSlice<'_>]) -> std::io::Result<usize>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut written = 0;
+    while !slices.is_empty() {
+        let n = writer.write_vectored(slices).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut slices, n);
+        written += n;
+    }
+    Ok(written)
 }
 
 /// Creates a new sender for transmitting messages over an async writer.
