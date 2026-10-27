@@ -743,3 +743,117 @@ where
         writer,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, IoSlice},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    use super::write_all_vectored;
+
+    #[derive(Default)]
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        error: Option<io::ErrorKind>,
+    }
+
+    // Deliberately uses AsyncWrite's default poll_write_vectored implementation.
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(error) = self.error {
+                return Poll::Ready(Err(error.into()));
+            }
+            let n = buf.len().min(self.limit);
+            self.bytes.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct VectoredWriter(ShortWriter);
+
+    impl AsyncWrite for VectoredWriter {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+            panic!("expected a vectored write")
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            slices: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut written = 0;
+            for slice in slices {
+                let n = slice.len().min(self.0.limit - written);
+                self.0.bytes.extend_from_slice(&slice[..n]);
+                written += n;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_vectored_writes_and_scalar_fallback() {
+        // Exercise writes ending inside a slice, on a boundary, and across slices.
+        for limit in 1..=10 {
+            let mut vectored = VectoredWriter(ShortWriter {
+                limit,
+                ..Default::default()
+            });
+            let mut scalar = ShortWriter {
+                limit,
+                ..Default::default()
+            };
+            for mut writer in [&mut vectored as &mut (dyn AsyncWrite + Unpin), &mut scalar] {
+                let mut slices = [IoSlice::new(b"ab"), IoSlice::new(b"cde"), IoSlice::new(b"fghi")];
+                assert_eq!(write_all_vectored(&mut writer, &mut slices).await.unwrap(), 9);
+            }
+            assert_eq!(vectored.0.bytes, b"abcdefghi");
+            assert_eq!(scalar.bytes, b"abcdefghi");
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_write_errors() {
+        for (error, expected) in [
+            (None, io::ErrorKind::WriteZero),
+            (Some(io::ErrorKind::BrokenPipe), io::ErrorKind::BrokenPipe),
+        ] {
+            let mut writer = ShortWriter {
+                error,
+                ..Default::default()
+            };
+            let mut slices = [IoSlice::new(b"abc")];
+            assert_eq!(
+                write_all_vectored(&mut writer, &mut slices).await.unwrap_err().kind(),
+                expected
+            );
+            assert!(writer.bytes.is_empty());
+        }
+    }
+}
