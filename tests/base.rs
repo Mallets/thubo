@@ -62,14 +62,16 @@ async fn base() {
                 let payload = Bytes::from(value.to_le_bytes().repeat(512));
                 sender.send(&payload).await.unwrap();
             }
-            sender.stop().await;
-            drop(sender_task.stop().await.unwrap());
+            // Keep the connection open until the client has checked every echo.
+            sender
         });
         for value in 0..N {
             let (received, _) = receiver.recv().await.unwrap();
             assert_eq!(received.to_vec(), value.to_le_bytes().repeat(512));
         }
-        producer.await.unwrap();
+        let sender = producer.await.unwrap();
+        sender.stop().await;
+        drop(sender_task.stop().await.unwrap());
         receiver.stop().await;
         drop(reader_task.stop().await.unwrap());
         echo.await.unwrap();
