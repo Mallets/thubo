@@ -242,7 +242,7 @@ impl StageInPrio {
         &mut self,
         msg: &Bytes,
         config: &PushConfig,
-        start: Duration,
+        start: &mut Option<Duration>,
         backoff: &AtomicBackoff,
         notify: impl Fn() -> Result<(), SendError>,
         flush: impl Fn() -> bool,
@@ -289,6 +289,9 @@ impl StageInPrio {
                         }};
                     }
 
+                    // The push deadline is captured lazily: the fast path
+                    // (batch available) never pays for a clock read.
+                    let start = *start.get_or_insert_with(|| LOCAL_EPOCH.elapsed());
                     let timeout = LOCAL_EPOCH
                         .elapsed()
                         .checked_sub(start)
@@ -510,7 +513,8 @@ struct StageIn {
 impl StageIn {
     #[inline]
     pub(crate) async fn push(&self, msg: &Bytes, config: &PushConfig) -> Result<(), SendError> {
-        let start = LOCAL_EPOCH.elapsed();
+        // Taken lazily inside `StageInPrio::push`; only waits pay for it.
+        let mut start = None;
         let p = config.qos.priority();
 
         // Lock the queue: try first to try_lock and then a lock with timeout (which is slow)
@@ -532,7 +536,9 @@ impl StageIn {
             status::any(self.status.unset(f), f)
         };
 
-        let to_notify = queue.push(msg, config, start, &self.backoff[p], notify, flush).await?;
+        let to_notify = queue
+            .push(msg, config, &mut start, &self.backoff[p], notify, flush)
+            .await?;
         drop(queue);
 
         if to_notify {
@@ -760,6 +766,35 @@ impl PipelineTxOut {
         self.stage_out.refill(batch);
     }
 
+    /// Pulls a batch that is ready, without waiting. It stops at the first booked
+    /// batch, leaving it to [`PipelineTxOut::pull`] so priority order is preserved.
+    pub(crate) fn try_pull(&mut self) -> Option<WriteBatch> {
+        'outer: while !self.stage_in.status.any(status::DISABLED) {
+            for p in Priority::ALL {
+                match self.stage_out.ringbuf_inout_r.pull_priority(p) {
+                    Pull::Some(mut batch) => {
+                        let cf = status::congested(batch.qos.priority());
+                        let is_congested = status::any(self.stage_in.status.unset(cf), cf);
+
+                        if (is_congested && batch.qos.congestion_control() == CongestionControl::Drop)
+                            || batch.drop.as_ref().is_some_and(|df| df.load(Ordering::Relaxed))
+                        {
+                            self.stage_out.refill(batch);
+                            continue 'outer;
+                        }
+
+                        batch.write_len();
+                        return Some(batch);
+                    }
+                    Pull::Booked => return None,
+                    Pull::None => {}
+                }
+            }
+            return None;
+        }
+        None
+    }
+
     pub(crate) async fn drain(&mut self) -> Vec<WriteBatch> {
         let mut batches = vec![];
 
@@ -775,8 +810,9 @@ impl PipelineTxOut {
             si.flush();
         }
 
-        while let Some(b) = self.stage_out.ringbuf_inout_r.pull() {
-            batches.push(b);
+        while let Some(mut batch) = self.stage_out.ringbuf_inout_r.pull() {
+            batch.write_len();
+            batches.push(batch);
         }
 
         batches

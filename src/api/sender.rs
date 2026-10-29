@@ -14,6 +14,7 @@
 #[cfg(feature = "stats")]
 use std::sync::atomic::AtomicUsize;
 use std::{
+    io::IoSlice,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -23,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     buffers::Bytes,
+    collections::SingleOrVec,
     pipeline::{
         status,
         tx::{PipelineTxIn, PipelineTxOut, PullConfig, PushConfig, SendError},
@@ -603,30 +605,32 @@ async fn write_task<W>(
 where
     W: AsyncWriteExt + Send + Sync + Unpin + 'static,
 {
+    // Maximum number of ready batches coalesced into a single vectored write
+    const COALESCE_MAX_BATCHES: usize = 8;
+
     // Helper macro for writing data to the network with timeout protection
-    macro_rules! write_batch {
-        ($batch:expr) => {{
+    macro_rules! write_batches {
+        ($batches:ident) => {{
             let timeout = inner.write_timeout.load(Ordering::Relaxed);
             tokio::time::timeout(timeout, async {
-                let mut written = 0;
-
-                // Write the frame header (contains batch size and header)
-                let frame = $batch.frame.as_slice();
-                writer.write_all(frame).await?;
-                written += frame.len();
-
-                // Write each fragment slice in the batch (the actual message data)
-                // This is no-op in case the message is not fragmented
-                for s in $batch.fragment.slices() {
-                    writer.write_all(s).await?;
-                    written += s.len();
+                // Gather the frame (batch size and header) and the fragment slices
+                // (the actual message data) of every batch in a single vectored write
+                let mut slices = SingleOrVec::new();
+                for batch in $batches.as_slice() {
+                    slices.push(IoSlice::new(batch.frame.as_slice()));
+                    if !batch.fragment.is_empty() {
+                        slices.extend(batch.fragment.slices().map(IoSlice::new));
+                    }
                 }
+                let written = write_all_vectored(&mut writer, slices.as_mut_slice()).await?;
 
                 // Flush
                 writer.flush().await?;
 
-                // Return the batch buffer to the pool for reuse
-                pipeline_out.refill($batch);
+                // Return the batch buffers to the pool for reuse
+                for batch in $batches {
+                    pipeline_out.refill(batch);
+                }
                 Ok::<usize, std::io::Error>(written)
             })
             .await
@@ -664,28 +668,56 @@ where
             None => break,
         };
 
-        // Write the batch to the network
-        let Ok(Ok(_written)) = write_batch!(batch) else {
+        // Coalesce the batches that are already ready, without waiting for more
+        let mut batches = SingleOrVec::single(batch);
+        while batches.len() < COALESCE_MAX_BATCHES {
+            let Some(batch) = pipeline_out.try_pull() else { break };
+            batches.push(batch);
+        }
+        #[cfg(feature = "stats")]
+        let count = batches.len();
+
+        // Write the batches to the network
+        let Ok(Ok(_written)) = write_batches!(batches) else {
             break; // Network error - terminate
         };
 
         // Update statistics (only with `stats` feature)
         #[cfg(feature = "stats")]
         {
-            inner.stats.batches_count.fetch_add(1, Ordering::Release);
+            inner.stats.batches_count.fetch_add(count, Ordering::Release);
             inner.stats.bytes_count.fetch_add(_written, Ordering::Release);
         }
     }
 
     // Graceful shutdown: drain and transmit remaining batches
     for batch in pipeline_out.drain().await.drain(..) {
-        let Ok(Ok(_)) = write_batch!(batch) else {
+        let batches = SingleOrVec::single(batch);
+        let Ok(Ok(_)) = write_batches!(batches) else {
             break; // Stop on first error during drain
         };
     }
 
     // Return the underlying writer
     writer
+}
+
+/// Writes all the slices with vectored writes, looping over partial writes.
+/// Writers without vectored support fall back to one slice per write.
+async fn write_all_vectored<W>(writer: &mut W, mut slices: &mut [IoSlice<'_>]) -> std::io::Result<usize>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut written = 0;
+    while !slices.is_empty() {
+        let n = writer.write_vectored(slices).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        IoSlice::advance_slices(&mut slices, n);
+        written += n;
+    }
+    Ok(written)
 }
 
 /// Creates a new sender for transmitting messages over an async writer.
@@ -711,5 +743,119 @@ where
         timeout_progress: Duration::from_secs(10),
         timeout_batch: Duration::from_micros(100),
         writer,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{self, IoSlice},
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    use super::write_all_vectored;
+
+    #[derive(Default)]
+    struct ShortWriter {
+        bytes: Vec<u8>,
+        limit: usize,
+        error: Option<io::ErrorKind>,
+    }
+
+    // Deliberately uses AsyncWrite's default poll_write_vectored implementation.
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(error) = self.error {
+                return Poll::Ready(Err(error.into()));
+            }
+            let n = buf.len().min(self.limit);
+            self.bytes.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct VectoredWriter(ShortWriter);
+
+    impl AsyncWrite for VectoredWriter {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+            panic!("expected a vectored write")
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            slices: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let mut written = 0;
+            for slice in slices {
+                let n = slice.len().min(self.0.limit - written);
+                self.0.bytes.extend_from_slice(&slice[..n]);
+                written += n;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_vectored_writes_and_scalar_fallback() {
+        // Exercise writes ending inside a slice, on a boundary, and across slices.
+        for limit in 1..=10 {
+            let mut vectored = VectoredWriter(ShortWriter {
+                limit,
+                ..Default::default()
+            });
+            let mut scalar = ShortWriter {
+                limit,
+                ..Default::default()
+            };
+            for mut writer in [&mut vectored as &mut (dyn AsyncWrite + Unpin), &mut scalar] {
+                let mut slices = [IoSlice::new(b"ab"), IoSlice::new(b"cde"), IoSlice::new(b"fghi")];
+                assert_eq!(write_all_vectored(&mut writer, &mut slices).await.unwrap(), 9);
+            }
+            assert_eq!(vectored.0.bytes, b"abcdefghi");
+            assert_eq!(scalar.bytes, b"abcdefghi");
+        }
+    }
+
+    #[tokio::test]
+    async fn vectored_write_errors() {
+        for (error, expected) in [
+            (None, io::ErrorKind::WriteZero),
+            (Some(io::ErrorKind::BrokenPipe), io::ErrorKind::BrokenPipe),
+        ] {
+            let mut writer = ShortWriter {
+                error,
+                ..Default::default()
+            };
+            let mut slices = [IoSlice::new(b"abc")];
+            assert_eq!(
+                write_all_vectored(&mut writer, &mut slices).await.unwrap_err().kind(),
+                expected
+            );
+            assert!(writer.bytes.is_empty());
+        }
     }
 }
