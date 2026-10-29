@@ -618,7 +618,9 @@ where
                 let mut slices = SingleOrVec::new();
                 for batch in $batches.as_slice() {
                     slices.push(IoSlice::new(batch.frame.as_slice()));
-                    slices.extend(batch.fragment.slices().map(IoSlice::new));
+                    if !batch.fragment.is_empty() {
+                        slices.extend(batch.fragment.slices().map(IoSlice::new));
+                    }
                 }
                 let written = write_all_vectored(&mut writer, slices.as_mut_slice()).await?;
 
